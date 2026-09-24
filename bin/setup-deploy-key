@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+BASE=/openbayes/home/coding-worker
+SECRETS="$BASE/secrets"
+PRIVATE_KEY="$SECRETS/github_deploy_key"
+PUBLIC_KEY="$PRIVATE_KEY.pub"
+KNOWN_HOSTS="$SECRETS/known_hosts"
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || fail "setup-deploy-key must run as root"
+getent passwd codingworker >/dev/null 2>&1 || fail "Run install.sh/bootstrap-runtime.sh first"
+command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is required"
+command -v ssh-keyscan >/dev/null 2>&1 || fail "ssh-keyscan is required"
+
+install -d -m 700 -o codingworker -g codingworker "$SECRETS"
+if [ ! -f "$PRIVATE_KEY" ]; then
+    chpst -u codingworker:codingworker ssh-keygen \
+        -q -t ed25519 -N '' -C "coding-worker-deploy-key" -f "$PRIVATE_KEY"
+elif [ ! -f "$PUBLIC_KEY" ]; then
+    chpst -u codingworker:codingworker ssh-keygen -y -f "$PRIVATE_KEY" >"$PUBLIC_KEY"
+fi
+
+if [ ! -s "$KNOWN_HOSTS" ]; then
+    temp_hosts=$(mktemp "$SECRETS/known_hosts.XXXXXX")
+    trap 'rm -f "$temp_hosts"' EXIT HUP INT TERM
+    ssh-keyscan -H github.com >"$temp_hosts" 2>/dev/null
+    [ -s "$temp_hosts" ] || fail "Could not obtain GitHub SSH host keys"
+    chown codingworker:codingworker "$temp_hosts"
+    chmod 600 "$temp_hosts"
+    mv "$temp_hosts" "$KNOWN_HOSTS"
+    trap - EXIT HUP INT TERM
+fi
+
+chown codingworker:codingworker "$PRIVATE_KEY" "$PUBLIC_KEY" "$KNOWN_HOSTS"
+chmod 600 "$PRIVATE_KEY" "$KNOWN_HOSTS"
+chmod 644 "$PUBLIC_KEY"
+
+echo "Deploy key is ready. Add this public key to exactly one GitHub repository"
+echo "with 'Allow write access' enabled:"
+cat "$PUBLIC_KEY"
+echo
+echo "Verify GitHub's published SSH host-key fingerprints before first production use:"
+ssh-keygen -lf "$KNOWN_HOSTS"

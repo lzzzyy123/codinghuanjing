@@ -1,7 +1,5 @@
 ---
 title: Short task title
-# Optional; defaults to agent/<RFC filename stem>:
-# branch: agent/RFC-YYYYMMDD-NNN
 test_command: "pytest -q"
 lint_command: ""
 build_command: ""
@@ -48,7 +46,7 @@ Compatibility, performance, security, style, or dependency constraints.
 
 ## Test Requirements
 
-Required cases and expected commands. The worker executes the commands from YAML front matter independently at the fixed project root.
+Required cases and expected commands. The Worker executes the commands from YAML front matter independently in the RFC's isolated worktree.
 
 ## Rollback
 
@@ -57,3 +55,5 @@ How to revert or disable the change.
 ## Notes
 
 Additional implementation context. Do not include credentials.
+
+Do not specify a project, repository, working directory, base branch, or task branch. The container binding is authoritative, and the Worker always creates `agent/<RFC-ID>`.

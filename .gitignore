@@ -1,5 +1,7 @@
 # Secrets and host-local configuration
 config/worker.env
+secrets/
+tools/client.env
 
 # Persistent runtime state (created by bootstrap-runtime.sh)
 todo/
@@ -19,6 +21,7 @@ __pycache__/
 # Local test fixtures and editor files
 test-project/
 e2e-*.md
+RFC-*.md
 .DS_Store
 .idea/
 .vscode/

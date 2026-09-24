@@ -1,86 +1,111 @@
-# Single-Project Unattended Coding Worker
+# Single-Repository Unattended Coding Worker
 
-This repository installs one unattended Coding Worker for exactly one Git project:
-
-```text
-one OpenBayes container = one PROJECT_ROOT = one Coding Worker
-```
-
-The persistent installation lives at `/openbayes/home/coding-worker`. `/opt/coding-worker` is a compatibility symlink. The Worker implements:
+This mother template installs one unattended Coding Worker for exactly one GitHub repository:
 
 ```text
-RFC -> isolated Coder -> independent tests -> isolated Reviewer
-    -> PASS: commit task branch, never merge
-    -> REQUEST_CHANGES: new Coder process, then review again
+one OpenBayes container = one GitHub repository = one project = one Worker
 ```
 
-See [INSTALL.md](INSTALL.md) for a clean-container installation and recovery procedure.
+The persistent source and runtime root is `/openbayes/home/coding-worker`; `/opt/coding-worker` is a compatibility symlink. The complete delivery lifecycle is:
 
-## Project Binding
+```text
+RFC -> fetch origin/main -> agent/<RFC-ID> + isolated worktree
+    -> fresh Coder -> Worker-run tests -> fresh independent Reviewer
+    -> REQUEST_CHANGES: fresh Coder, bounded review loop
+    -> PASS: commit -> non-force push task branch -> PR from the Mac
+    -> human or upper-level project Agent decides whether to merge
+```
 
-The only project is fixed in `config/worker.env`:
+The Worker never merges the base branch, force-pushes, deploys, or accepts a repository/path/branch from an RFC.
+
+See [INSTALL.md](INSTALL.md) for clean-container installation and recovery. Mac requirement Agents must follow [docs/MAC_PROJECT_AGENT.md](docs/MAC_PROJECT_AGENT.md).
+
+## First Installation
+
+```bash
+git clone https://github.com/lzzzyy123/codinghuanjing.git /openbayes/home/coding-worker
+cd /openbayes/home/coding-worker
+cp config/worker.env.example config/worker.env
+chmod 600 config/worker.env
+# Set the scoped LiteLLM URL/key; leave PROJECT_ROOT empty.
+./install.sh
+./bin/coding-workerctl deploy-key-init
+```
+
+Add the printed public key to the target repository at GitHub **Settings -> Deploy keys**, with **Allow write access** enabled. Then bind once:
+
+```bash
+./bin/coding-workerctl bind git@github.com:OWNER/REPOSITORY.git main
+```
+
+Binding refuses non-GitHub SSH URLs, an existing different project, or an invalid base branch. It clones into `/openbayes/home/project`, stores the real `origin` in Git config, updates `PROJECT_ROOT`, restarts the service, and runs the full doctor. It never deletes, resets, or overwrites an existing project.
+
+## Repository Binding
+
+Host-local binding lives in ignored `config/worker.env`:
 
 ```text
 PROJECT_ROOT=/openbayes/home/project
 BASE_BRANCH=main
+GIT_REMOTE=origin
 ```
 
-`PROJECT_ROOT=` is a supported unbound state. The daemon stays healthy but leaves `todo/inbox` untouched. After cloning a project, set `PROJECT_ROOT`, ensure `codingworker` owns or can write it, and restart:
+The remote URL from `git remote get-url origin` is authoritative. `PROJECT_ROOT=` is a supported unbound state: the daemon stays up but does not claim inbox RFCs.
 
 ```bash
-/opt/coding-worker/bootstrap-runtime.sh
-/opt/coding-worker/bin/coding-workerctl restart
-/opt/coding-worker/bin/coding-workerctl doctor
+/opt/coding-worker/bin/coding-workerctl project
 ```
 
-Do not change `PROJECT_ROOT` while an RFC is in `todo/working`.
-
-## Architecture
-
-- PID 1 `runit` supervises a lightweight Python polling daemon.
-- An exclusive `flock` permits only one Worker process.
-- An atomic rename claims `inbox -> working`; files in `working` are recovered after restart.
-- Every RFC gets a dedicated worktree below `worktrees/<RFC-ID>`.
-- The default branch is `agent/<RFC-ID>`; an RFC may explicitly override `branch` with another `agent/...` name.
-- Every Coder and Reviewer invocation is a fresh Claude Code process with session persistence disabled.
-- The Worker, not the Agent, runs the RFC's lint/build/test commands and records exact output and exit codes.
-- Reviewer output is strict JSON: `PASS` or `REQUEST_CHANGES`.
-- Agent errors, tests, Git operations, coder cycles, and review cycles are bounded.
-- `PASS` creates a commit on the task branch. The Worker never merges, pushes, deploys, or changes the configured base branch.
-- First version concurrency is fixed at one.
-
-## Source And Runtime Layout
+Example output:
 
 ```text
-/openbayes/home/coding-worker/
-├── .gitignore
-├── README.md
-├── INSTALL.md
-├── install.sh
-├── bootstrap-runtime.sh
-├── bin/coding-workerctl
-├── config/
-│   ├── worker.env.example       # tracked, no secrets
-│   └── worker.env               # ignored, root:root 0600
-├── service/
-│   ├── run
-│   └── log/run
-├── templates/RFC_TEMPLATE.md
-├── worker/
-│   ├── watcher.py
-│   └── prompts/{coder,reviewer}.md
-├── todo/{inbox,working,done,failed}/   # ignored runtime state
-├── reports/                           # ignored runtime state
-├── worktrees/                         # ignored runtime state
-├── runtime/                           # ignored locks
-└── worker/logs/                       # ignored logs
+Project root: /openbayes/home/project
+Base branch: main
+Remote: origin
+Repository: git@github.com:OWNER/REPOSITORY.git
+Current branch: main
+Working tree: clean
+Status: bound
 ```
 
-The bound project is outside this tree, normally `/openbayes/home/project`. Project code is never part of the Coding Worker repository.
+## Authentication And Privilege Separation
 
-## RFC Format
+The container uses one repository-scoped writable SSH Deploy Key, not a personal SSH key or broad PAT. The private key is ignored by Git, stored at `secrets/github_deploy_key`, owned by `codingworker`, and mode `0600`.
 
-RFCs no longer contain a project, repository, base branch, or working directory. Those fields are rejected. Start from `templates/RFC_TEMPLATE.md`:
+- The root daemon only orchestrates fixed Worker code and filesystem state.
+- `codingworker:codingproject` performs Git operations and can read the Deploy Key.
+- `codingagent:codingproject` runs Coder, Reviewer, and project commands. It cannot read the Deploy Key or modify project Git metadata/hooks.
+- Git hooks are disabled for the bound clone. Agent children receive a small environment allowlist and no GitHub credential.
+- The scoped LiteLLM credential necessarily reaches Claude Code as its Anthropic API credential.
+
+This is process-level least privilege for a dedicated, single-tenant project container, not a hostile-code VM sandbox.
+
+## Branch And Delivery Invariants
+
+For every accepted RFC:
+
+```text
+RFC-20260924-003
+<-> agent/RFC-20260924-003
+<-> reports/RFC-20260924-003/
+<-> one commit and GitHub PR
+```
+
+Before creating a new branch, the Worker must successfully fetch `origin/$BASE_BRANCH`; it branches from that remote-tracking commit, never a stale local main. The RFC cannot override branch/base/repository paths. After independent tests and review both pass, the Worker creates a commit:
+
+```text
+RFC-20260924-003: short title
+
+RFC: RFC-20260924-003
+Tests: PASS
+Review: PASS
+```
+
+It then performs a normal, non-force push of only `agent/<RFC-ID>`. A failed fetch or push fails the task with evidence. The container has no GitHub API token, so it generates `pr-description.md` and a compare URL; the authenticated Mac creates the PR. This keeps API permission out of the project container.
+
+## RFC Standard
+
+`templates/RFC_TEMPLATE.md` is the only format. YAML front matter contains only a title and Worker-run commands:
 
 ```yaml
 ---
@@ -91,62 +116,101 @@ build_command: ""
 ---
 ```
 
-At least one test/lint/build command is required. Commands execute from the root of the task worktree and are trusted operator input.
+At least one test/lint/build command is required. The following fields are rejected: `project`, `repository`, `working_directory`, `base_branch`, and `branch`. The body describes WHAT, WHY, boundaries, acceptance criteria, constraints, tests, and rollback. RFC commands are trusted operator input and run as `codingagent` in the isolated worktree.
 
-Upload to a temporary path and atomically rename into the queue:
+## Daily Mac Flow
+
+Configure ignored `tools/client.env` from its example, then:
 
 ```bash
-scp -P <port> RFC-20260924-001.md root@<host>:/opt/coding-worker/todo/RFC-20260924-001.md.upload
-ssh -p <port> root@<host> \
-  'mv /opt/coding-worker/todo/RFC-20260924-001.md.upload /opt/coding-worker/todo/inbox/RFC-20260924-001.md'
+tools/submit-rfc.sh RFC-20260924-003.md
+tools/rfc-status.sh RFC-20260924-003
+tools/create-pr.sh RFC-20260924-003
 ```
 
-Do not reuse a completed RFC ID.
+Submission uses a partial `.upload-*` name, validates remotely, and atomically renames into `todo/inbox`. PR creation uses the Mac's authenticated `gh`, uploads no token to the container, records the PR URL in `status.json`, and never merges.
+
+## Audit Trail
+
+Each `reports/<RFC-ID>/` contains:
+
+```text
+status.json             machine state, branch, base commit, commit, push, PR
+coder-report.md         implementation, files, decisions, alternatives, deviations, risks
+review-report.md        human-readable acceptance/security/architecture/test review
+coder-attempt-*.md      per-cycle Coder report history
+review-attempt-*.md     per-cycle Reviewer report history
+review-latest.json      machine-readable PASS or REQUEST_CHANGES
+tests.log               Worker commands, exit codes, stdout, stderr, timeouts
+diff.patch              accepted Git diff
+pr-description.md       durable PR index content
+worker.log              lifecycle events and failures
+raw/                    independent Claude CLI envelopes and stderr
+```
+
+The container retains full execution evidence. The GitHub PR is the durable repository-visible index containing RFC ID, goal, acceptance criteria, summary, decisions, tests, verdict, and commit. Reports are not silently committed into business repositories.
 
 ## Operations
 
 ```bash
-/opt/coding-worker/bin/coding-workerctl status
-/opt/coding-worker/bin/coding-workerctl doctor
-/opt/coding-worker/bin/coding-workerctl project
-/opt/coding-worker/bin/coding-workerctl queue
-/opt/coding-worker/bin/coding-workerctl logs
-/opt/coding-worker/bin/coding-workerctl restart
-/opt/coding-worker/bin/coding-workerctl stop
-/opt/coding-worker/bin/coding-workerctl start
-/opt/coding-worker/bin/coding-workerctl bootstrap
+coding-workerctl project
+coding-workerctl status
+coding-workerctl logs
+coding-workerctl queue
+coding-workerctl rfc-status RFC-YYYYMMDD-NNN
+coding-workerctl doctor
+coding-workerctl restart
+coding-workerctl stop
+coding-workerctl start
+coding-workerctl bootstrap
 ```
 
-The machine-readable result is `reports/<RFC-ID>/status.json`. Each report also contains Coder and Reviewer reports, per-attempt raw envelopes, test logs, worker logs, the accepted diff, and failure history.
+Deploy Key and binding commands:
 
-## Configuration
+```bash
+coding-workerctl deploy-key-init
+coding-workerctl deploy-key-show
+coding-workerctl bind git@github.com:OWNER/REPOSITORY.git main
+coding-workerctl record-pr RFC-ID https://github.com/OWNER/REPOSITORY/pull/123
+```
 
-`config/worker.env` is sourced by the root-owned runit launcher before privileges are dropped to UID/GID 22022. Required settings are:
+`doctor` verifies runtime permissions, service health, LiteLLM and exact model availability, a real Claude Code call, binding, remote/base, fetch/auth, a non-destructive `git push --dry-run`, and Deploy Key isolation. It does not modify main or create a remote branch.
+
+## Crash And Failure Behavior
+
+An exclusive flock permits one daemon. Atomic rename claims `inbox -> working`; startup recovers `working` before new work. Agent/test/Git timeouts and coder/reviewer/error cycles are bounded. Terminal failures move the RFC to `todo/failed` and retain worktree/reports. Successful RFCs move to `todo/done`; successful worktrees are removed by default after the pushed commit is verified.
+
+Never reuse a completed RFC ID. After correcting an infrastructure failure, a failed RFC may be deliberately requeued; its existing exact task branch/worktree and report history make recovery idempotent.
+
+## Persistent Layout
 
 ```text
-PROJECT_ROOT=
-BASE_BRANCH=main
-LITELLM_BASE_URL=https://your-litellm.example.com
-LITELLM_API_KEY=replace-me
-MODEL=xiaosuan-8
+/openbayes/home/
+├── coding-worker/                 mother source + host-local runtime
+│   ├── bin/
+│   ├── config/worker.env          ignored, root:root 0600
+│   ├── docs/
+│   ├── secrets/                   ignored, Deploy Key, 0700
+│   ├── service/
+│   ├── templates/
+│   ├── tools/
+│   ├── worker/
+│   ├── todo/{inbox,working,done,failed}/
+│   ├── reports/
+│   ├── worktrees/
+│   └── runtime/
+├── project/                       the one bound GitHub clone
+├── coding-worker-home/
+├── coding-agent-home/
+└── .local/                        pinned Node.js + Claude Code
 ```
 
-The launcher maps LiteLLM values to Claude Code's Anthropic environment and automatically puts the gateway hostname in `NO_PROXY`, which is required for private OpenBayes gateway addresses.
+After an OpenBayes runtime rebuild, restore users, permissions, `/opt`, `/etc/service`, and `/init.sh` links with:
 
-## Crash Recovery
+```bash
+/openbayes/home/coding-worker/bootstrap-runtime.sh
+```
 
-The RFC remains in `todo/working`, its branch and worktree remain intact, and every retry starts a new Agent context. Run `coding-workerctl restart`; the Worker resumes `working` before claiming another RFC. A commit created just before a crash is detected and reused instead of duplicated.
+## Never Commit Or Copy
 
-Failed worktrees are retained for diagnosis. Successful worktrees are removed after commit, while the branch and commit remain in `PROJECT_ROOT`.
-
-## Security Boundary
-
-- Never commit or copy `config/worker.env`.
-- The API key is intentionally available to the Agent process environment; use a scoped, rate-limited LiteLLM key.
-- RFC commands and project code execute as `codingworker`; this is a trusted single-tenant worker, not a hostile-code sandbox.
-- The `.gitignore` excludes secrets, reports, queues, worktrees, locks, logs, virtual environments, and test fixtures.
-- Copy or publish only files tracked by this repository. Never package the directory with `tar` without applying the ignore boundary.
-
-## Known Behavior
-
-Claude Code may print `unrecognized_model` for the custom `xiaosuan-8` alias. LiteLLM requests still use that exact model, and the CLI result is valid when its JSON envelope reports `subtype: success` and `is_error: false`.
+Do not publish `config/worker.env`, `secrets/`, Deploy Keys, API keys, `tools/client.env`, `.venv`, project code, queues, reports, worktrees, runtime locks, service state, logs, or E2E fixtures. Copy or push only tracked mother-template files. A final secret scan is required before release.

@@ -18,10 +18,11 @@ export ANTHROPIC_API_KEY=$LITELLM_API_KEY
 export ANTHROPIC_AUTH_TOKEN=$LITELLM_API_KEY
 export NO_PROXY="localhost,127.0.0.1,${LITELLM_HOST}${NO_PROXY:+,$NO_PROXY}"
 export no_proxy=$NO_PROXY
+umask 0027
 
 export HOME=/openbayes/home/coding-worker-home
 export USER=codingworker
 export LOGNAME=codingworker
 export PATH=/openbayes/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-exec chpst -u codingworker:codingworker "$BASE/.venv/bin/python" "$BASE/worker/watcher.py"
+exec "$BASE/.venv/bin/python" "$BASE/worker/watcher.py"

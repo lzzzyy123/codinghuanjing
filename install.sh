@@ -30,6 +30,7 @@ command -v curl >/dev/null 2>&1 || missing_packages="$missing_packages curl"
 command -v git >/dev/null 2>&1 || missing_packages="$missing_packages git"
 command -v sha256sum >/dev/null 2>&1 || missing_packages="$missing_packages coreutils"
 command -v xz >/dev/null 2>&1 || missing_packages="$missing_packages xz-utils"
+command -v ssh-keygen >/dev/null 2>&1 || missing_packages="$missing_packages openssh-client"
 if [ -n "$missing_packages" ]; then
     apt-get update
     # shellcheck disable=SC2086
@@ -97,7 +98,8 @@ if [ ! -f "$BASE/config/worker.env" ]; then
     echo "Created config/worker.env from the example. Set LiteLLM credentials before production use."
 fi
 
-chmod 755 "$BASE/install.sh" "$BASE/bootstrap-runtime.sh"
+chmod 755 "$BASE/install.sh" "$BASE/bootstrap-runtime.sh" "$BASE/bin/"* \
+    "$BASE/worker/watcher.py" "$BASE/worker/doctor.py" "$BASE/worker/control.py"
 "$BASE/bootstrap-runtime.sh"
 
 sleep 2

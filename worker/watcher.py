@@ -15,10 +15,12 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +44,7 @@ PROMPTS = BASE / "worker" / "prompts"
 PROJECT_ROOT_VALUE = os.environ.get("PROJECT_ROOT", "").strip()
 PROJECT_ROOT = Path(PROJECT_ROOT_VALUE).resolve() if PROJECT_ROOT_VALUE else None
 BASE_BRANCH = os.environ.get("BASE_BRANCH", "main").strip()
+GIT_REMOTE = os.environ.get("GIT_REMOTE", "origin").strip()
 MODEL = os.environ.get("MODEL", "xiaosuan-8")
 AGENT_CLI = os.environ.get("AGENT_CLI", "/openbayes/home/.local/bin/claude")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
@@ -56,6 +59,10 @@ KEEP_SUCCESS_WORKTREES = os.environ.get("KEEP_SUCCESS_WORKTREES", "false").lower
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 BRANCH_RE = re.compile(r"^agent/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$")
+GIT_RUNNER = ["chpst", "-u", "codingworker:codingproject", str(BASE / "bin" / "git-exec")]
+AGENT_RUNNER = ["chpst", "-u", "codingagent:codingproject", str(BASE / "bin" / "agent-exec")]
+WORKER_HOME = "/openbayes/home/coding-worker-home"
+AGENT_HOME = "/openbayes/home/coding-agent-home"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,14 +161,85 @@ def execute(
         return CommandResult(display, 124, stdout, stderr, timed_out=True)
 
 
+def validate_worktree_pointer(cwd: Path) -> None:
+    if PROJECT_ROOT is None or cwd == PROJECT_ROOT:
+        return
+    try:
+        cwd.relative_to(WORKTREES)
+    except ValueError:
+        return
+    pointer = cwd / ".git"
+    if not pointer.is_file() or pointer.is_symlink():
+        raise TaskFailure(f"Task worktree has an invalid .git pointer: {pointer}")
+    match = re.fullmatch(r"gitdir: (.+)\n?", pointer.read_text(encoding="utf-8"))
+    if not match:
+        raise TaskFailure(f"Task worktree .git pointer has invalid content: {pointer}")
+    target = Path(match.group(1)).resolve()
+    expected_parent = (PROJECT_ROOT / ".git" / "worktrees").resolve()
+    if expected_parent not in target.parents or not target.is_dir():
+        raise TaskFailure("Task worktree .git pointer escaped the bound repository")
+    target_stat = target.stat()
+    pointer_stat = pointer.stat()
+    if target_stat.st_uid != 22022 or stat.S_IMODE(target_stat.st_mode) & 0o022:
+        raise TaskFailure("Task worktree Git metadata has unsafe ownership or permissions")
+    if pointer_stat.st_uid != 22022 or stat.S_IMODE(pointer_stat.st_mode) & 0o022:
+        raise TaskFailure("Task worktree .git pointer has unsafe ownership or permissions")
+
+
 def git(cwd: Path, *args: str, check: bool = True) -> CommandResult:
-    result = execute(["git", *args], cwd, GIT_TIMEOUT)
+    validate_worktree_pointer(cwd)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": WORKER_HOME,
+        "USER": "codingworker",
+        "LOGNAME": "codingworker",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    result = execute([*GIT_RUNNER, "git", *args], cwd, GIT_TIMEOUT, env=env)
     if check and not result.ok:
         raise TaskFailure(
             f"Git command failed: {result.command}\n"
             f"stdout:\n{safe_tail(result.stdout)}\nstderr:\n{safe_tail(result.stderr)}"
         )
     return result
+
+
+def protect_git_metadata(repo: Path, worktree: Path) -> None:
+    """Protect configuration and this worktree's metadata from Agent writes."""
+    git_dir = repo / ".git"
+    targets = [git_dir / "config", git_dir / "hooks"]
+    worktree_git_dir = Path(git(worktree, "rev-parse", "--git-dir").stdout.strip()).resolve()
+    if worktree_git_dir != git_dir and git_dir in worktree_git_dir.parents:
+        targets.append(worktree_git_dir)
+    for target in targets:
+        if not target.exists() or target.is_symlink():
+            continue
+        paths = [target]
+        if target.is_dir():
+            paths.extend(path for path in target.rglob("*") if not path.is_symlink())
+        for path in paths:
+            os.chown(path, 22022, 22024)
+            os.chmod(path, 0o750 if path.is_dir() else 0o640)
+    pointer = worktree / ".git"
+    if pointer.is_file():
+        os.chown(pointer, 22022, 22024)
+        os.chmod(pointer, 0o640)
+
+
+def prepare_agent_worktree(worktree: Path) -> None:
+    """Give codingagent write access to code without exposing Git metadata."""
+    paths = [worktree]
+    paths.extend(path for path in worktree.rglob("*") if not path.is_symlink())
+    for path in paths:
+        if path == worktree / ".git":
+            continue
+        os.chown(path, -1, 22024)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if path.is_dir():
+            os.chmod(path, mode | 0o2770)
+        else:
+            os.chmod(path, mode | 0o660)
 
 
 def parse_rfc(path: Path) -> tuple[dict[str, Any], str]:
@@ -179,15 +257,14 @@ def parse_rfc(path: Path) -> tuple[dict[str, Any], str]:
         raise TaskFailure(f"Invalid RFC YAML front matter: {exc}") from exc
     if not isinstance(metadata, dict):
         raise TaskFailure("RFC YAML front matter must be a mapping")
-    obsolete = sorted(set(metadata) & {"project", "repository", "base_branch", "working_directory"})
+    obsolete = sorted(
+        set(metadata)
+        & {"project", "repository", "base_branch", "working_directory", "branch"}
+    )
     if obsolete:
         raise TaskFailure(
             "Single-project RFCs must not set project location fields: " + ", ".join(obsolete)
         )
-    if metadata.get("branch") is not None and (
-        not isinstance(metadata["branch"], str) or not metadata["branch"].strip()
-    ):
-        raise TaskFailure("branch must be a non-empty string when provided")
     for command_key in ("test_command", "lint_command", "build_command"):
         if metadata.get(command_key) is not None and not isinstance(metadata[command_key], str):
             raise TaskFailure(f"{command_key} must be a string or null")
@@ -195,35 +272,63 @@ def parse_rfc(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def prepare_worktree(
-    task_id: str, metadata: dict[str, Any], report_dir: Path
-) -> tuple[Path, Path, str, str]:
+    task_id: str, report_dir: Path, allow_existing: bool
+) -> tuple[Path, Path, str, str, str]:
     if PROJECT_ROOT is None:
         raise TaskFailure("Worker is not bound to a project; set PROJECT_ROOT and restart")
     repo = PROJECT_ROOT
-    branch = str(metadata.get("branch", f"agent/{task_id}")).strip()
+    branch = f"agent/{task_id}"
     base_branch = BASE_BRANCH
     if not BRANCH_RE.fullmatch(branch):
         raise TaskFailure("branch must start with agent/ and be a valid task branch")
     if branch in {"main", "master", base_branch}:
         raise TaskFailure("task branch must differ from main/master/base_branch")
     git(repo, "check-ref-format", "--branch", branch)
-    git(repo, "rev-parse", "--verify", base_branch)
+    task_log(report_dir, f"Fetching latest {GIT_REMOTE}/{base_branch}")
+    git(
+        repo,
+        "fetch",
+        "--prune",
+        GIT_REMOTE,
+        f"+refs/heads/{base_branch}:refs/remotes/{GIT_REMOTE}/{base_branch}",
+    )
+    base_ref = f"refs/remotes/{GIT_REMOTE}/{base_branch}"
+    git(repo, "rev-parse", "--verify", base_ref)
 
     worktree = (WORKTREES / task_id).resolve()
     if worktree.exists():
+        if not allow_existing:
+            raise TaskFailure(f"Worktree already exists for new RFC ID {task_id}")
         git(worktree, "rev-parse", "--is-inside-work-tree")
         active_branch = git(worktree, "branch", "--show-current").stdout.strip()
         if active_branch != branch:
             raise TaskFailure(f"existing worktree uses {active_branch}, expected {branch}")
     else:
         branch_exists = git(repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False).ok
+        if not branch_exists:
+            remote_branch = git(
+                repo, "ls-remote", "--exit-code", "--heads", GIT_REMOTE, branch, check=False
+            )
+            if remote_branch.ok:
+                git(
+                    repo,
+                    "fetch",
+                    GIT_REMOTE,
+                    f"refs/heads/{branch}:refs/heads/{branch}",
+                )
+                branch_exists = True
+        if branch_exists and not allow_existing:
+            raise TaskFailure(f"Task branch already exists for new RFC ID {task_id}")
         args = ["worktree", "add", str(worktree), branch]
         if not branch_exists:
-            args = ["worktree", "add", "-b", branch, str(worktree), base_branch]
+            args = ["worktree", "add", "-b", branch, str(worktree), base_ref]
         git(repo, *args)
         task_log(report_dir, f"Created worktree {worktree} on {branch}")
 
-    return repo, worktree, base_branch, branch
+    prepare_agent_worktree(worktree)
+    protect_git_metadata(repo, worktree)
+    base_commit = git(worktree, "merge-base", "HEAD", base_ref).stdout.strip()
+    return repo, worktree, base_branch, branch, base_commit
 
 
 def load_prompt(name: str) -> str:
@@ -232,6 +337,7 @@ def load_prompt(name: str) -> str:
 
 def run_agent_once(role: str, prompt: str, cwd: Path, report_dir: Path, label: str) -> str:
     command = [
+        *AGENT_RUNNER,
         AGENT_CLI,
         "-p",
         "--model",
@@ -241,14 +347,23 @@ def run_agent_once(role: str, prompt: str, cwd: Path, report_dir: Path, label: s
         "--no-session-persistence",
         "--dangerously-skip-permissions",
     ]
-    env = os.environ.copy()
-    env.update(
-        {
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "DISABLE_TELEMETRY": "1",
-            "DISABLE_ERROR_REPORTING": "1",
-        }
-    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": AGENT_HOME,
+        "USER": "codingagent",
+        "LOGNAME": "codingagent",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", ""),
+        "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+        "ANTHROPIC_AUTH_TOKEN": os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
+        "NO_PROXY": os.environ.get("NO_PROXY", ""),
+        "no_proxy": os.environ.get("no_proxy", ""),
+        "GIT_OPTIONAL_LOCKS": "0",
+        "PYTHONPYCACHEPREFIX": f"{AGENT_HOME}/.cache/coding-worker/{report_dir.name}",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+    }
     task_log(report_dir, f"Starting independent {role} process ({label})")
     result = execute(command, cwd, AGENT_TIMEOUT, input_text=prompt, env=env)
     raw_path = report_dir / "raw" / f"{label}.json"
@@ -305,7 +420,17 @@ def workspace_fingerprint(worktree: Path, base_branch: str) -> str:
 
 def run_test_command(name: str, command: str, cwd: Path, report_dir: Path) -> CommandResult:
     task_log(report_dir, f"Running {name}: {command}")
-    result = execute(["bash", "-lc", command], cwd, TEST_TIMEOUT)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": AGENT_HOME,
+        "USER": "codingagent",
+        "LOGNAME": "codingagent",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "PYTHONPYCACHEPREFIX": f"{AGENT_HOME}/.cache/coding-worker/{report_dir.name}",
+    }
+    result = execute(
+        [*AGENT_RUNNER, "bash", "-lc", command], cwd, TEST_TIMEOUT, env=env
+    )
     header = (
         f"\n===== {utc_now()} {name} =====\n"
         f"COMMAND: {command}\nEXIT_CODE: {result.returncode}\nTIMED_OUT: {str(result.timed_out).lower()}\n"
@@ -358,14 +483,166 @@ def validate_review(text: str) -> dict[str, Any]:
     verdict = review.get("verdict")
     if verdict not in {"PASS", "REQUEST_CHANGES"}:
         raise AgentFailure("Reviewer verdict must be PASS or REQUEST_CHANGES")
-    issues = review.get("issues")
+    issues = review.get("required_changes", review.get("issues"))
     if not isinstance(issues, list) or not all(isinstance(issue, str) for issue in issues):
-        raise AgentFailure("Reviewer issues must be an array of strings")
+        raise AgentFailure("Reviewer required_changes must be an array of strings")
     if verdict == "REQUEST_CHANGES" and not issues:
         raise AgentFailure("REQUEST_CHANGES must include at least one issue")
     if verdict == "PASS" and issues:
-        raise AgentFailure("PASS must use an empty issues array")
+        raise AgentFailure("PASS must use an empty required_changes array")
+    review["required_changes"] = issues
+    for key in (
+        "summary",
+        "test_review",
+        "architecture_scope_review",
+        "security_review",
+    ):
+        if not isinstance(review.get(key), str) or not review[key].strip():
+            raise AgentFailure(f"Reviewer {key} must be a non-empty string")
+    for key in ("acceptance_criteria", "code_review_findings", "regression_risks"):
+        if not isinstance(review.get(key), list) or not all(
+            isinstance(item, str) for item in review[key]
+        ):
+            raise AgentFailure(f"Reviewer {key} must be an array of strings")
     return review
+
+
+CODER_REPORT_HEADINGS = (
+    "# Coding Report",
+    "## Summary",
+    "## Files Changed",
+    "## Implementation Details",
+    "## Technical Decisions",
+    "## RFC Deviations",
+    "## Tests",
+    "## Known Limitations",
+    "## Risks",
+    "## Follow-up Suggestions",
+)
+
+
+def coder_report_errors(text: str) -> list[str]:
+    return [heading for heading in CODER_REPORT_HEADINGS if heading not in text]
+
+
+def normalize_coder_report(text: str) -> str:
+    marker = text.find("# Coding Report")
+    return text[marker:].strip() if marker >= 0 else text.strip()
+
+
+def markdown_list(items: list[str], empty: str = "None.") -> str:
+    return "\n".join(f"- {item}" for item in items) if items else empty
+
+
+def render_review_report(review: dict[str, Any], task_id: str, attempt: int, cycle: int) -> str:
+    return f"""# Review Report - {task_id}
+
+Attempt {attempt}, review cycle {cycle}.
+
+## Verdict
+
+{review['verdict']}
+
+## Acceptance Criteria Review
+
+{markdown_list(review['acceptance_criteria'])}
+
+## Code Review Findings
+
+{markdown_list(review['code_review_findings'])}
+
+## Test Review
+
+{review['test_review']}
+
+## Architecture / Scope Review
+
+{review['architecture_scope_review']}
+
+## Security Review
+
+{review['security_review']}
+
+## Regression Risks
+
+{markdown_list(review['regression_risks'])}
+
+## Required Changes
+
+{markdown_list(review['required_changes'])}
+"""
+
+
+def markdown_section(text: str, heading: str) -> str:
+    pattern = re.compile(
+        rf"^## {re.escape(heading)}\s*$\n(.*?)(?=^##\s+|\Z)", re.MULTILINE | re.DOTALL
+    )
+    match = pattern.search(text)
+    return match.group(1).strip() if match else "Not stated."
+
+
+def github_repository_url(remote_url: str) -> Optional[str]:
+    match = re.fullmatch(r"git@github\.com:([^/]+)/(.+?)(?:\.git)?", remote_url)
+    if not match:
+        return None
+    return f"https://github.com/{match.group(1)}/{match.group(2)}"
+
+
+def create_pr_description(
+    task_id: str,
+    rfc_text: str,
+    metadata: dict[str, Any],
+    coder_report: str,
+    review: dict[str, Any],
+    commit_sha: str,
+    report_dir: Path,
+) -> str:
+    acceptance = markdown_section(rfc_text, "Acceptance Criteria").replace("- [ ]", "- [x]")
+    commands = [
+        str(metadata.get(key, "")).strip()
+        for key in ("lint_command", "build_command", "test_command")
+        if str(metadata.get(key, "")).strip()
+    ]
+    test_lines = "\n".join(f"- PASS: `{command}`" for command in commands)
+    description = f"""## RFC
+
+{task_id}
+
+## Goal
+
+{markdown_section(rfc_text, 'Goal')}
+
+## Acceptance Criteria
+
+{acceptance}
+
+## Implementation
+
+{markdown_section(coder_report, 'Summary')}
+
+## Key Decisions
+
+{markdown_section(coder_report, 'Technical Decisions')}
+
+## Tests
+
+{test_lines}
+- Full evidence: `reports/{task_id}/tests.log` in the bound container
+
+## Reviewer
+
+{review['verdict']}: {review['summary']}
+
+## Commit
+
+`{commit_sha}`
+
+## Reports
+
+Container report: `reports/{task_id}/`
+"""
+    (report_dir / "pr-description.md").write_text(description, encoding="utf-8")
+    return description
 
 
 def update_status(report_dir: Path, state: dict[str, Any], **changes: Any) -> None:
@@ -413,16 +690,16 @@ def reviewer_prompt(
     )
 
 
-def commit_result(task_id: str, title: str, worktree: Path, base_branch: str, report_dir: Path) -> str:
+def commit_result(task_id: str, title: str, worktree: Path, base_ref: str, report_dir: Path) -> str:
     git(worktree, "add", "-A")
     if git(worktree, "diff", "--cached", "--quiet", check=False).returncode == 0:
         head = git(worktree, "rev-parse", "HEAD").stdout.strip()
-        base = git(worktree, "rev-parse", base_branch).stdout.strip()
+        base = git(worktree, "rev-parse", base_ref).stdout.strip()
         if head == base:
             raise TaskFailure("Coder produced no committable changes")
         # A prior worker may have committed and crashed before final status was
         # persisted. Reusing that task-branch commit makes recovery idempotent.
-        final_diff = git(worktree, "diff", "--binary", f"{base_branch}...HEAD", "--").stdout
+        final_diff = git(worktree, "diff", "--binary", f"{base_ref}...HEAD", "--").stdout
         (report_dir / "diff.patch").write_text(final_diff, encoding="utf-8")
         return head
     message = f"{task_id}: {title}" if title else task_id
@@ -433,13 +710,38 @@ def commit_result(task_id: str, title: str, worktree: Path, base_branch: str, re
         "-c",
         "user.email=coding-worker@localhost",
         "commit",
+        "--no-verify",
         "-m",
         message,
+        "-m",
+        f"RFC: {task_id}\nTests: PASS\nReview: PASS",
     )
     commit_sha = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    final_diff = git(worktree, "diff", "--binary", f"{base_branch}...HEAD", "--").stdout
+    final_diff = git(worktree, "diff", "--binary", f"{base_ref}...HEAD", "--").stdout
     (report_dir / "diff.patch").write_text(final_diff, encoding="utf-8")
     return commit_sha
+
+
+def push_result(
+    repo: Path, task_id: str, branch: str, commit_sha: str
+) -> tuple[str, Optional[str]]:
+    if branch != f"agent/{task_id}" or not BRANCH_RE.fullmatch(branch):
+        raise TaskFailure(f"Refusing to push unsafe task branch: {branch}")
+    if branch in {BASE_BRANCH, "main", "master"}:
+        raise TaskFailure("Refusing to push a protected base branch")
+    git(repo, "push", GIT_REMOTE, f"refs/heads/{branch}:refs/heads/{branch}")
+    remote_line = git(repo, "ls-remote", "--heads", GIT_REMOTE, branch).stdout.strip()
+    if not remote_line or remote_line.split()[0] != commit_sha:
+        raise TaskFailure("Remote task branch does not resolve to the accepted commit after push")
+    remote_url = git(repo, "remote", "get-url", GIT_REMOTE).stdout.strip()
+    repository_url = github_repository_url(remote_url)
+    compare_url = None
+    if repository_url:
+        compare_url = (
+            f"{repository_url}/compare/{urllib.parse.quote(BASE_BRANCH, safe='')}..."
+            f"{urllib.parse.quote(branch, safe='')}?expand=1"
+        )
+    return remote_url, compare_url
 
 
 def process_task(rfc_path: Path) -> None:
@@ -450,7 +752,8 @@ def process_task(rfc_path: Path) -> None:
         raise TaskFailure(f"Invalid RFC filename stem: {task_id}")
 
     status_path = report_dir / "status.json"
-    if status_path.exists():
+    had_status = status_path.exists()
+    if had_status:
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -481,6 +784,7 @@ def process_task(rfc_path: Path) -> None:
             "phase": "initializing",
             "model": MODEL,
             "tests_passed": False,
+            "tests_status": "PENDING",
             "review": None,
             "review_cycles": 0,
             "coder_cycles": 0,
@@ -494,13 +798,21 @@ def process_task(rfc_path: Path) -> None:
     task_log(report_dir, f"Processing {rfc_path}")
 
     metadata, rfc_text = parse_rfc(rfc_path)
-    repo, worktree, base_branch, branch = prepare_worktree(task_id, metadata, report_dir)
+    repo, worktree, base_branch, branch, base_commit = prepare_worktree(
+        task_id, report_dir, had_status
+    )
+    base_ref = base_commit
     status.update(
         {
+            "title": str(metadata.get("title", "")).strip(),
             "project_root": str(repo),
             "worktree": str(worktree),
             "branch": branch,
             "base_branch": base_branch,
+            "base_commit": base_commit,
+            "git_remote": GIT_REMOTE,
+            "pr_status": "not_created",
+            "pr_url": None,
         }
     )
     update_status(report_dir, status, phase="coding")
@@ -523,16 +835,35 @@ def process_task(rfc_path: Path) -> None:
             report_dir,
             f"attempt-{attempt}-coder-{coder_cycle}",
         )
-        append_text(
-            report_dir / "coder-report.md",
-            f"\n# Attempt {attempt}, Coder Cycle {coder_cycle}\n\n{answer}\n",
+        answer = normalize_coder_report(answer)
+        (report_dir / f"coder-attempt-{attempt}-cycle-{coder_cycle}.md").write_text(
+            answer + "\n", encoding="utf-8"
         )
-        diff = combined_diff(worktree, base_branch)
+        (report_dir / "coder-report.md").write_text(answer + "\n", encoding="utf-8")
+        missing_headings = coder_report_errors(answer)
+        if missing_headings:
+            feedback = (
+                "Your Coding Report did not follow the mandatory format. Inspect the existing "
+                "implementation, make any needed corrections, and return a complete report containing: "
+                + ", ".join(missing_headings)
+            )
+            task_log(
+                report_dir,
+                f"Coder report format invalid after cycle {coder_cycle}: {', '.join(missing_headings)}",
+                logging.WARNING,
+            )
+            continue
+        diff = combined_diff(worktree, base_ref)
         (report_dir / "diff.patch").write_text(diff, encoding="utf-8")
 
-        update_status(report_dir, status, phase="testing")
+        update_status(report_dir, status, phase="testing", tests_status="RUNNING")
         tests_passed, test_summary = run_tests(metadata, worktree, report_dir)
-        update_status(report_dir, status, tests_passed=tests_passed)
+        update_status(
+            report_dir,
+            status,
+            tests_passed=tests_passed,
+            tests_status="PASS" if tests_passed else "FAIL",
+        )
         if not tests_passed:
             feedback = (
                 "The independent worker tests failed. Fix the implementation and rerun relevant tests.\n\n"
@@ -551,26 +882,25 @@ def process_task(rfc_path: Path) -> None:
             review_cycles=review_cycles,
             total_review_cycles=previous_total_reviews + review_cycles,
         )
-        before = workspace_fingerprint(worktree, base_branch)
+        before = workspace_fingerprint(worktree, base_ref)
         review_text = run_agent(
             "Reviewer",
             reviewer_prompt(
-                rfc_text, task_id, worktree, base_branch, branch, report_dir, review_cycles
+                rfc_text, task_id, worktree, base_ref, branch, report_dir, review_cycles
             ),
             worktree,
             report_dir,
             f"attempt-{attempt}-reviewer-{review_cycles}",
         )
-        after = workspace_fingerprint(worktree, base_branch)
+        after = workspace_fingerprint(worktree, base_ref)
         if before != after:
             raise TaskFailure("Reviewer modified the task worktree; review aborted")
         review = validate_review(review_text)
-        append_text(
-            report_dir / "review-report.md",
-            f"\n# Attempt {attempt}, Review Cycle {review_cycles}\n\n```json\n"
-            + json.dumps(review, ensure_ascii=False, indent=2)
-            + "\n```\n",
+        human_review = render_review_report(review, task_id, attempt, review_cycles)
+        (report_dir / f"review-attempt-{attempt}-cycle-{review_cycles}.md").write_text(
+            human_review, encoding="utf-8"
         )
+        (report_dir / "review-report.md").write_text(human_review, encoding="utf-8")
         atomic_json(report_dir / f"review-attempt-{attempt}-cycle-{review_cycles}.json", review)
         atomic_json(report_dir / "review-latest.json", review)
         update_status(report_dir, status, review=review["verdict"])
@@ -578,7 +908,12 @@ def process_task(rfc_path: Path) -> None:
         if review["verdict"] == "PASS":
             update_status(report_dir, status, phase="committing")
             commit_sha = commit_result(
-                task_id, str(metadata.get("title", "")).strip(), worktree, base_branch, report_dir
+                task_id, str(metadata.get("title", "")).strip(), worktree, base_ref, report_dir
+            )
+            update_status(report_dir, status, phase="pushing", commit_sha=commit_sha)
+            remote_url, compare_url = push_result(repo, task_id, branch, commit_sha)
+            create_pr_description(
+                task_id, rfc_text, metadata, answer, review, commit_sha, report_dir
             )
             update_status(
                 report_dir,
@@ -587,10 +922,16 @@ def process_task(rfc_path: Path) -> None:
                 phase="complete",
                 commit_sha=commit_sha,
                 tests_passed=True,
+                tests_status="PASS",
                 review="PASS",
+                push="PASS",
+                remote_url=remote_url,
+                compare_url=compare_url,
+                pr_status="not_created",
+                pr_url=None,
                 completed_at=utc_now(),
             )
-            task_log(report_dir, f"Completed with commit {commit_sha}")
+            task_log(report_dir, f"Completed and pushed {branch} at {commit_sha}")
             if not KEEP_SUCCESS_WORKTREES:
                 git(repo, "worktree", "remove", "--force", str(worktree))
                 git(repo, "worktree", "prune")
@@ -598,7 +939,8 @@ def process_task(rfc_path: Path) -> None:
             return
 
         feedback = "Independent review requested these changes:\n" + "\n".join(
-            f"{index}. {issue}" for index, issue in enumerate(review["issues"], start=1)
+            f"{index}. {issue}"
+            for index, issue in enumerate(review["required_changes"], start=1)
         )
         task_log(report_dir, f"Reviewer requested changes in cycle {review_cycles}", logging.WARNING)
 
@@ -704,12 +1046,14 @@ def validate_runtime() -> None:
         raise RuntimeError("This worker version requires MAX_CONCURRENT_TASKS=1")
     if MAX_REVIEW_CYCLES < 1 or MAX_CODER_CYCLES < 1 or MAX_CONSECUTIVE_ERRORS < 1:
         raise RuntimeError("Cycle and error limits must be positive")
-    if os.geteuid() == 0:
-        raise RuntimeError("Worker must run as a non-root user")
+    if os.geteuid() != 0:
+        raise RuntimeError("Worker orchestrator must run as root and drop privileges for every child")
     if not Path(AGENT_CLI).is_file():
         raise RuntimeError(f"Agent CLI does not exist: {AGENT_CLI}")
     if not BASE_BRANCH:
         raise RuntimeError("BASE_BRANCH must not be empty")
+    if not GIT_REMOTE or not re.fullmatch(r"[A-Za-z0-9._-]+", GIT_REMOTE):
+        raise RuntimeError("GIT_REMOTE must be a simple non-empty remote name")
     if PROJECT_ROOT is not None:
         if not Path(PROJECT_ROOT_VALUE).is_absolute():
             raise RuntimeError("PROJECT_ROOT must be an absolute path")
@@ -722,9 +1066,7 @@ def validate_runtime() -> None:
         if PROJECT_ROOT == BASE or BASE in PROJECT_ROOT.parents:
             raise RuntimeError("PROJECT_ROOT must not be the Coding Worker source tree or a child of it")
         git(PROJECT_ROOT, "rev-parse", "--git-dir")
-        git(PROJECT_ROOT, "rev-parse", "--verify", BASE_BRANCH)
-        if not os.access(PROJECT_ROOT, os.R_OK | os.W_OK | os.X_OK):
-            raise RuntimeError(f"codingworker cannot read and write PROJECT_ROOT: {PROJECT_ROOT}")
+        git(PROJECT_ROOT, "remote", "get-url", GIT_REMOTE)
     for directory in (INBOX, WORKING, DONE, FAILED, REPORTS, WORKTREES, RUNTIME):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -750,9 +1092,10 @@ def main() -> int:
         )
     else:
         LOG.info(
-            "Coding worker started: base=%s project=%s base_branch=%s model=%s poll=%ss",
+            "Coding worker started: base=%s project=%s remote=%s base_branch=%s model=%s poll=%ss",
             BASE,
             PROJECT_ROOT,
+            GIT_REMOTE,
             BASE_BRANCH,
             MODEL,
             POLL_INTERVAL,

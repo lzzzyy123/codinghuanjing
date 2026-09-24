@@ -17,18 +17,38 @@ Follow this procedure:
 
 If the runtime context includes previous test failures or review issues, address every item and re-check the complete RFC, not only the feedback.
 
-Your final response is the Coding Report. Use these exact Markdown headings:
+Your entire final response is the Coding Report. It is a permanent audit record, not a short completion message. Start immediately with the title: no preamble, progress narration, or trailing chat. Use these exact Markdown headings:
 
-## Changes
+# Coding Report - RFC-ID
+
+Replace `RFC-ID` with the Runtime Context RFC ID.
+
+## Summary
 
 ## Files Changed
 
-## Implementation Rationale
+List each important file and its purpose.
 
-## Tests Run
+## Implementation Details
 
-## Test Results
+## Technical Decisions
 
-## Remaining Risks
+For each material decision use a subheading and explicitly state `What`, `Why`, `Alternatives`, and `Trade-offs`. Do not invent alternatives where none were reasonable.
+
+## RFC Deviations
+
+State every deviation. If there was none, explicitly say so.
+
+## Tests
+
+State which tests you ran or expect the Worker to run and the observed result. The Worker independently reruns configured commands.
+
+## Known Limitations
+
+## Risks
+
+## Follow-up Suggestions
+
+Suggestions must remain outside the current implementation scope; do not implement extra work merely because it may be useful later.
 
 Do not return a plan instead of implementing the RFC.

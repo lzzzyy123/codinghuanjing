@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+
+BASE=/openbayes/home/coding-worker
+CONFIG="$BASE/config/worker.env"
+PROJECT_ROOT=/openbayes/home/project
+PRIVATE_KEY="$BASE/secrets/github_deploy_key"
+KNOWN_HOSTS="$BASE/secrets/known_hosts"
+REPOSITORY=${1:-}
+BASE_BRANCH=${2:-main}
+GIT_REMOTE=origin
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+git_as_worker() {
+    env HOME=/openbayes/home/coding-worker-home \
+        GIT_TERMINAL_PROMPT=0 \
+        chpst -u codingworker:codingproject "$BASE/bin/git-exec" git "$@"
+}
+
+update_setting() {
+    key=$1
+    value=$2
+    temporary=$(mktemp "$BASE/config/worker.env.XXXXXX")
+    awk -v key="$key" -v value="$value" '
+        BEGIN { found = 0 }
+        index($0, key "=") == 1 { print key "=" value; found = 1; next }
+        { print }
+        END { if (!found) print key "=" value }
+    ' "$CONFIG" >"$temporary"
+    chown root:root "$temporary"
+    chmod 600 "$temporary"
+    mv "$temporary" "$CONFIG"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "bind-project must run as root"
+[ -n "$REPOSITORY" ] || fail "Usage: coding-workerctl bind git@github.com:OWNER/REPO.git [BASE_BRANCH]"
+echo "$REPOSITORY" | grep -Eq '^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$' || fail \
+    "Repository must be a GitHub SSH URL: git@github.com:OWNER/REPO.git"
+echo "$BASE_BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' || fail "Invalid base branch"
+[ -f "$CONFIG" ] || fail "Missing $CONFIG; run install.sh first"
+[ -r "$PRIVATE_KEY" ] && [ -r "$KNOWN_HOSTS" ] || fail \
+    "Deploy key is missing; run coding-workerctl deploy-key-init first"
+
+set -a
+. "$CONFIG"
+set +a
+if [ -n "${PROJECT_ROOT:-}" ] && [ "$PROJECT_ROOT" != "/openbayes/home/project" ]; then
+    fail "Worker is already bound to a different PROJECT_ROOT: $PROJECT_ROOT"
+fi
+
+SSH_COMMAND="ssh -i $PRIVATE_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+export GIT_SSH_COMMAND="$SSH_COMMAND"
+
+if [ -e /openbayes/home/project ]; then
+    [ -d /openbayes/home/project/.git ] || fail \
+        "/openbayes/home/project already exists and is not a Git repository; refusing to overwrite it"
+    existing=$(git_as_worker -C /openbayes/home/project remote get-url "$GIT_REMOTE" 2>/dev/null || true)
+    [ "$existing" = "$REPOSITORY" ] || fail \
+        "Existing project origin is '$existing', not '$REPOSITORY'; refusing to rebind"
+else
+    clone_target="/openbayes/home/.coding-worker-project-clone-$$"
+    [ ! -e "$clone_target" ] || fail "Temporary clone path already exists: $clone_target"
+    install -d -m 2770 -o codingworker -g codingproject "$clone_target"
+    if ! git_as_worker \
+        clone --origin "$GIT_REMOTE" --branch "$BASE_BRANCH" --single-branch \
+        "$REPOSITORY" "$clone_target"; then
+        fail "Clone failed. The isolated partial clone remains at $clone_target for diagnosis; no existing data was changed"
+    fi
+    mv "$clone_target" /openbayes/home/project
+fi
+
+git_as_worker -C /openbayes/home/project config core.sshCommand "$SSH_COMMAND"
+git_as_worker -C /openbayes/home/project config core.hooksPath /dev/null
+git_as_worker -C /openbayes/home/project remote get-url "$GIT_REMOTE" | grep -Fx "$REPOSITORY" >/dev/null || fail \
+    "origin verification failed"
+git_as_worker -C /openbayes/home/project fetch --prune "$GIT_REMOTE" \
+    "+refs/heads/$BASE_BRANCH:refs/remotes/$GIT_REMOTE/$BASE_BRANCH"
+git_as_worker -C /openbayes/home/project rev-parse --verify \
+    "refs/remotes/$GIT_REMOTE/$BASE_BRANCH" >/dev/null
+
+chown -R codingworker:codingproject /openbayes/home/project
+chmod -R u+rwX,g+rX,o-rwx /openbayes/home/project
+find /openbayes/home/project -type d -exec chmod g+s {} +
+
+update_setting PROJECT_ROOT /openbayes/home/project
+update_setting BASE_BRANCH "$BASE_BRANCH"
+update_setting GIT_REMOTE "$GIT_REMOTE"
+
+"$BASE/bootstrap-runtime.sh"
+SVDIR=/etc/service sv restart coding-worker
+sleep 2
+"$BASE/bin/coding-workerctl" doctor
+echo "Project binding complete."
+"$BASE/bin/coding-workerctl" project

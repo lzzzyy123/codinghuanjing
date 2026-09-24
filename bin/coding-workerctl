@@ -5,7 +5,7 @@ BASE=/openbayes/home/coding-worker
 CONFIG="$BASE/config/worker.env"
 
 usage() {
-    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap}"
+    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|record-pr}"
 }
 
 load_config() {
@@ -40,40 +40,43 @@ case "${1:-}" in
         ;;
     project)
         load_config
-        if [ -z "${PROJECT_ROOT:-}" ]; then
-            echo "UNBOUND"
-        else
-            echo "PROJECT_ROOT=$PROJECT_ROOT"
-            echo "BASE_BRANCH=${BASE_BRANCH:-main}"
-        fi
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" project
         ;;
     doctor)
         load_config
-        echo "CODING_WORKER_HOME=${CODING_WORKER_HOME:-$BASE}"
-        echo "MODEL=${MODEL:-xiaosuan-8}"
-        echo "LITELLM_BASE_URL=${LITELLM_BASE_URL:-<missing>}"
-        if [ -z "${LITELLM_API_KEY:-}" ] || [ "$LITELLM_API_KEY" = "replace-me" ]; then
-            echo "LITELLM_API_KEY=NOT_CONFIGURED"
-        else
-            echo "LITELLM_API_KEY=configured"
-        fi
-        "$BASE/.venv/bin/python" --version
-        PATH=/openbayes/home/.local/bin:$PATH node --version
-        /openbayes/home/.local/bin/claude --version
-        if [ -z "${PROJECT_ROOT:-}" ]; then
-            echo "PROJECT=UNBOUND (inbox processing is paused)"
-        else
-            echo "PROJECT_ROOT=$PROJECT_ROOT"
-            echo "BASE_BRANCH=${BASE_BRANCH:-main}"
-            env HOME=/openbayes/home/coding-worker-home \
-                chpst -u codingworker:codingworker git -C "$PROJECT_ROOT" rev-parse --show-toplevel
-            env HOME=/openbayes/home/coding-worker-home \
-                chpst -u codingworker:codingworker git -C "$PROJECT_ROOT" rev-parse --verify "${BASE_BRANCH:-main}"
-        fi
-        SVDIR=/etc/service sv status coding-worker
+        "$BASE/.venv/bin/python" "$BASE/worker/doctor.py"
         ;;
     bootstrap)
         exec "$BASE/bootstrap-runtime.sh"
+        ;;
+    deploy-key-init)
+        exec "$BASE/bin/setup-deploy-key"
+        ;;
+    deploy-key-show)
+        [ -f "$BASE/secrets/github_deploy_key.pub" ] || {
+            echo "Deploy key has not been generated. Run: coding-workerctl deploy-key-init" >&2
+            exit 1
+        }
+        cat "$BASE/secrets/github_deploy_key.pub"
+        ;;
+    bind)
+        shift
+        exec "$BASE/bin/bind-project" "$@"
+        ;;
+    rfc-status)
+        load_config
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" rfc-status "$2"
+        ;;
+    record-pr)
+        load_config
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" record-pr "$2" "$3"
+        ;;
+    enqueue-upload)
+        load_config
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" enqueue-upload "$2" "$3"
         ;;
     *)
         usage
