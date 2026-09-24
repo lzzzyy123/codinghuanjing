@@ -85,6 +85,11 @@ if [ -e /etc/service/coding-worker ] && [ ! -L /etc/service/coding-worker ]; the
 fi
 ln -sfn "$BASE/service" /etc/service/coding-worker
 
+if [ -e /usr/local/bin/coding-workerctl ] && [ ! -L /usr/local/bin/coding-workerctl ]; then
+    fail "/usr/local/bin/coding-workerctl exists and is not a symlink; refusing to replace it"
+fi
+ln -sfn "$BASE/bin/coding-workerctl" /usr/local/bin/coding-workerctl
+
 if [ ! -e /init.sh ] || [ -L /init.sh ]; then
     ln -sfn "$BASE/bootstrap-runtime.sh" /init.sh
 else

@@ -104,6 +104,7 @@ The bootstrap also creates persistent state directories and these runtime links:
 ```text
 /opt/coding-worker -> /openbayes/home/coding-worker
 /etc/service/coding-worker -> /openbayes/home/coding-worker/service
+/usr/local/bin/coding-workerctl -> /openbayes/home/coding-worker/bin/coding-workerctl
 /init.sh -> /openbayes/home/coding-worker/bootstrap-runtime.sh
 ```
 

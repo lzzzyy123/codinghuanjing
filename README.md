@@ -205,7 +205,7 @@ Never reuse a completed RFC ID. After correcting an infrastructure failure, a fa
 └── .local/                        pinned Node.js + Claude Code
 ```
 
-After an OpenBayes runtime rebuild, restore users, permissions, `/opt`, `/etc/service`, and `/init.sh` links with:
+After an OpenBayes runtime rebuild, restore users, permissions, `/opt`, `/etc/service`, `/usr/local/bin/coding-workerctl`, and `/init.sh` links with:
 
 ```bash
 /openbayes/home/coding-worker/bootstrap-runtime.sh
