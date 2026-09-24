@@ -1,0 +1,3 @@
+#!/bin/sh
+BASE=/openbayes/home/coding-worker
+exec chpst -u codingworker:codingworker svlogd -tt "$BASE/worker/logs/service"

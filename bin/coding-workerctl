@@ -1,0 +1,82 @@
+#!/bin/sh
+set -eu
+
+BASE=/openbayes/home/coding-worker
+CONFIG="$BASE/config/worker.env"
+
+usage() {
+    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap}"
+}
+
+load_config() {
+    [ -f "$CONFIG" ] || {
+        echo "Missing $CONFIG" >&2
+        exit 1
+    }
+    set -a
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    set +a
+}
+
+case "${1:-}" in
+    status)
+        SVDIR=/etc/service sv status coding-worker
+        ;;
+    start)
+        SVDIR=/etc/service sv up coding-worker
+        ;;
+    stop)
+        SVDIR=/etc/service sv down coding-worker
+        ;;
+    restart)
+        SVDIR=/etc/service sv restart coding-worker
+        ;;
+    logs)
+        tail -n 200 -F "$BASE/worker/logs/service/current"
+        ;;
+    queue)
+        find "$BASE/todo" -mindepth 2 -maxdepth 2 -type f -name '*.md' -print | sort
+        ;;
+    project)
+        load_config
+        if [ -z "${PROJECT_ROOT:-}" ]; then
+            echo "UNBOUND"
+        else
+            echo "PROJECT_ROOT=$PROJECT_ROOT"
+            echo "BASE_BRANCH=${BASE_BRANCH:-main}"
+        fi
+        ;;
+    doctor)
+        load_config
+        echo "CODING_WORKER_HOME=${CODING_WORKER_HOME:-$BASE}"
+        echo "MODEL=${MODEL:-xiaosuan-8}"
+        echo "LITELLM_BASE_URL=${LITELLM_BASE_URL:-<missing>}"
+        if [ -z "${LITELLM_API_KEY:-}" ] || [ "$LITELLM_API_KEY" = "replace-me" ]; then
+            echo "LITELLM_API_KEY=NOT_CONFIGURED"
+        else
+            echo "LITELLM_API_KEY=configured"
+        fi
+        "$BASE/.venv/bin/python" --version
+        PATH=/openbayes/home/.local/bin:$PATH node --version
+        /openbayes/home/.local/bin/claude --version
+        if [ -z "${PROJECT_ROOT:-}" ]; then
+            echo "PROJECT=UNBOUND (inbox processing is paused)"
+        else
+            echo "PROJECT_ROOT=$PROJECT_ROOT"
+            echo "BASE_BRANCH=${BASE_BRANCH:-main}"
+            env HOME=/openbayes/home/coding-worker-home \
+                chpst -u codingworker:codingworker git -C "$PROJECT_ROOT" rev-parse --show-toplevel
+            env HOME=/openbayes/home/coding-worker-home \
+                chpst -u codingworker:codingworker git -C "$PROJECT_ROOT" rev-parse --verify "${BASE_BRANCH:-main}"
+        fi
+        SVDIR=/etc/service sv status coding-worker
+        ;;
+    bootstrap)
+        exec "$BASE/bootstrap-runtime.sh"
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac

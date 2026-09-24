@@ -1,0 +1,24 @@
+# Secrets and host-local configuration
+config/worker.env
+
+# Persistent runtime state (created by bootstrap-runtime.sh)
+todo/
+reports/
+worktrees/
+runtime/
+worker/logs/
+service/supervise/
+service/log/supervise/
+projects/
+
+# Installed runtimes and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local test fixtures and editor files
+test-project/
+e2e-*.md
+.DS_Store
+.idea/
+.vscode/
