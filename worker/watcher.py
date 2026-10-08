@@ -1004,13 +1004,18 @@ def coder_prompt(
     feedback: str,
     cycle: int,
 ) -> str:
+    correction = (
+        f"\n# Required Corrections From Previous Attempt\n{feedback}\n"
+        if feedback and feedback not in rfc_text
+        else ""
+    )
     return (
         load_prompt("coder.md")
         + f"\n\n# Runtime Context\n"
         + f"RFC ID: {task_id}\nProject root: {PROJECT_ROOT}\nWorktree: {worktree}\nBranch: {branch}\n"
         + f"Working directory: {worktree}\nCoder cycle: {cycle}/{MAX_CODER_CYCLES}\n"
         + f"\n# RFC\n{rfc_text}\n"
-        + (f"\n# Required Corrections From Previous Attempt\n{feedback}\n" if feedback else "")
+        + correction
     )
 
 
@@ -1278,7 +1283,7 @@ def process_task(rfc_path: Path) -> None:
         amendment_text = amendment_path.read_text(encoding="utf-8")
     effective_rfc_text = rfc_text
     if amendment_text:
-        effective_rfc_text += "\n\n# Project Lead Amendment\n\n" + amendment_text
+        effective_rfc_text += "\n\n" + amendment_text
     update_status(report_dir, status, phase="coding")
 
     feedback = amendment_text

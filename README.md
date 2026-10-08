@@ -152,6 +152,8 @@ raw/                    independent Claude CLI envelopes and stderr
 
 The container retains full execution evidence. The GitHub PR is the durable repository-visible index containing RFC ID, goal, acceptance criteria, summary, decisions, tests, verdict, and commit. Reports are not silently committed into business repositories.
 
+For a Project Lead defect found before merge, `tools/amend-rfc.sh RFC-ID REPORT.md` queues a bounded correction cycle on the same RFC branch and preserves the existing PR URL and all prior evidence. Merged RFCs cannot be amended, and amendments cannot change scope.
+
 ## Operations
 
 ```bash

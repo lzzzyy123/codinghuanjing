@@ -63,3 +63,13 @@ reports/<RFC-ID>/pr-description.md
 ```
 
 If the RFC failed, report the exact failure and evidence. Do not silently reuse a completed RFC ID or broaden the old RFC; create a new RFC when the requested scope changes.
+
+## Amend An Unmerged RFC
+
+When Project Lead verification finds a defect in an otherwise completed but unmerged RFC, fill `templates/PROJECT_LEAD_AMENDMENT_TEMPLATE.md` and run:
+
+```bash
+tools/amend-rfc.sh RFC-20260924-003 PROJECT-LEAD-REPORT.md
+```
+
+This preserves the RFC ID, task branch, PR URL, commits, prior tests, reviews, and amendment history. The Worker starts a fresh Coder cycle with the report as focused feedback, reruns the configured module gates, starts an independent Reviewer, and runs the root-controlled full regression after PASS. Do not use an amendment to broaden scope, and never amend a merged RFC.
