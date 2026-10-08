@@ -7,11 +7,14 @@ import json
 from pathlib import Path
 
 from .leases import QueueStore
-from .registry import load_registry
+from .registry import Registry, RegistryError, load_registry
 from .replay import replay_legacy_reports
 from .scheduler import DagScheduler
 from .state_store import StateStore
 from .status import status_snapshot
+
+
+PRODUCTION_IN_SCOPE_COUNT = 806
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,10 +23,20 @@ def parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate")
     validate.add_argument("dag", type=Path)
     validate.add_argument("classification", type=Path, nargs="?")
+    validate.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="TEST FIXTURES ONLY: allow validation without the production classification/count gate",
+    )
     initialize = commands.add_parser("init")
     initialize.add_argument("dag", type=Path)
     initialize.add_argument("database", type=Path)
     initialize.add_argument("classification", type=Path, nargs="?")
+    initialize.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="TEST FIXTURES ONLY: allow initialization without the production classification/count gate",
+    )
     status = commands.add_parser("status")
     status.add_argument("dag", type=Path)
     status.add_argument("database", type=Path)
@@ -38,13 +51,34 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = parser().parse_args(argv)
-    if args.command == "validate":
+def _load_validated_registry(
+    root: argparse.ArgumentParser, args: argparse.Namespace
+) -> Registry:
+    if args.classification is None and not args.test_mode:
+        root.error(
+            f"{args.command} requires CLASSIFICATION in production mode; "
+            "--test-mode is only for synthetic test fixtures"
+        )
+    try:
         registry = load_registry(args.dag, args.classification)
+    except RegistryError as exc:
+        root.error(f"{args.command} registry validation failed: {exc}")
+    if not args.test_mode and registry.in_scope_count != PRODUCTION_IN_SCOPE_COUNT:
+        root.error(
+            f"{args.command} requires the production {PRODUCTION_IN_SCOPE_COUNT}-path "
+            f"partition, registry declares {registry.in_scope_count}"
+        )
+    return registry
+
+
+def main(argv: list[str] | None = None) -> None:
+    root = parser()
+    args = root.parse_args(argv)
+    if args.command == "validate":
+        registry = _load_validated_registry(root, args)
         print(json.dumps({"valid": True, "digest": registry.digest, "rfcs": len(registry.rfcs)}))
     elif args.command == "init":
-        registry = load_registry(args.dag, args.classification)
+        registry = _load_validated_registry(root, args)
         store = StateStore(args.database, args.database.parent / "evidence")
         store.import_registry(registry)
         scheduler = DagScheduler(registry, store)

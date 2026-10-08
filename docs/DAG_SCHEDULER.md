@@ -57,11 +57,13 @@ These commands do not change the legacy Worker service:
 
 ```bash
 coding-workerctl scheduler-validate \
-  /openbayes/home/project/coordination/rfc-dag.v1.json
+  /openbayes/home/project/coordination/rfc-dag.v1.json \
+  /openbayes/home/project/baseline/classification.json
 
 coding-workerctl scheduler-init \
   /openbayes/home/project/coordination/rfc-dag.v1.json \
-  /openbayes/home/coding-worker/runtime/scheduler/state.sqlite3
+  /openbayes/home/coding-worker/runtime/scheduler/state.sqlite3 \
+  /openbayes/home/project/baseline/classification.json
 
 coding-workerctl scheduler-status \
   /openbayes/home/project/coordination/rfc-dag.v1.json \
@@ -74,6 +76,44 @@ coding-workerctl scheduler-history \
 coding-workerctl scheduler-replay /openbayes/home/coding-worker/reports
 coding-workerctl scheduler-canary
 ```
+
+`scheduler-validate` and `scheduler-init` are production gates. Both require the
+pinned classification file, verify its digest, and prove that the DAG owns each
+of the 806 `in_scope` paths exactly once. The underlying Python CLI has an
+explicit `--test-mode` escape hatch for synthetic fixtures with smaller
+partitions; `coding-workerctl` deliberately does not expose that flag.
+
+## Active Runner CLI Contract (Not Yet Enabled)
+
+The existing daemon only reconciles shadow state and must remain unchanged
+until production cutover is approved. A real runner needs one new process
+entrypoint, not daemon-side model execution:
+
+```text
+coding-scheduler-runner \
+  --database STATE.sqlite3 \
+  --dag RFC_DAG.json \
+  --classification classification.json \
+  --runtime-root RUNTIME_ROOT \
+  --repository PROJECT_ROOT \
+  --agent-id UNIQUE_ID \
+  --role coder|tester|reviewer|integrator \
+  --model MODEL_ID \
+  [--once]
+```
+
+On startup it must validate the same classification/DAG identity, register one
+agent identity and role, then repeatedly perform `claim -> start -> heartbeat ->
+fenced result`. Role/kind compatibility remains owned by `QueueStore`.
+Coder/integrator processes request mutable isolated worktrees through the Git
+broker; Reviewers receive only detached read-only snapshots; testers execute
+the commands pinned in the leased RFC revision. The process must stop cleanly
+on lease loss and may publish no result after its fencing token expires.
+
+No runner command may merge `main`, hold the Deploy Key directly, bypass
+resource admission, or accept `--test-mode`. `coding-workerctl` should expose
+runner start/stop/status only after runit service definitions, Unix identities,
+resource limits, and the production-switch approval token exist.
 
 The standalone shadow service is `service/scheduler/run`. Installing its runit link is a production control-plane change and requires explicit operator approval. The daemon itself rejects every mode other than `shadow`.
 

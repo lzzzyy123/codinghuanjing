@@ -6,6 +6,8 @@ CONFIG="$BASE/config/worker.env"
 
 usage() {
     echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|wait-rfc|retry-review|record-pr|enqueue-amendment|scheduler-validate|scheduler-init|scheduler-status|scheduler-history|scheduler-replay|scheduler-recover|scheduler-canary}"
+    echo "  coding-workerctl scheduler-validate DAG CLASSIFICATION"
+    echo "  coding-workerctl scheduler-init DAG DATABASE CLASSIFICATION"
 }
 
 load_config() {
@@ -94,14 +96,22 @@ case "${1:-}" in
         "$BASE/.venv/bin/python" "$BASE/worker/control.py" enqueue-upload "$2" "$3"
         ;;
     scheduler-validate)
-        [ "$#" -eq 2 ] || { usage; exit 2; }
+        [ "$#" -eq 3 ] || {
+            echo "scheduler-validate requires DAG and CLASSIFICATION; production validation cannot skip the 806-path partition check" >&2
+            usage
+            exit 2
+        }
         cd "$BASE"
-        "$BASE/.venv/bin/python" -m scheduler.cli validate "$2"
+        "$BASE/.venv/bin/python" -m scheduler.cli validate "$2" "$3"
         ;;
     scheduler-init)
-        [ "$#" -eq 3 ] || { usage; exit 2; }
+        [ "$#" -eq 4 ] || {
+            echo "scheduler-init requires DAG, DATABASE, and CLASSIFICATION; production initialization cannot skip the 806-path partition check" >&2
+            usage
+            exit 2
+        }
         cd "$BASE"
-        "$BASE/.venv/bin/python" -m scheduler.cli init "$2" "$3"
+        "$BASE/.venv/bin/python" -m scheduler.cli init "$2" "$3" "$4"
         ;;
     scheduler-status)
         [ "$#" -eq 3 ] || { usage; exit 2; }
