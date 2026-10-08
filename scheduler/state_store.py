@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS registries (
     baseline_commit TEXT NOT NULL,
     classification_sha256 TEXT NOT NULL,
     in_scope_count INTEGER NOT NULL,
+    config_data_count INTEGER NOT NULL DEFAULT 0,
     imported_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rfc_revisions (
@@ -199,6 +200,13 @@ class StateStore:
 
     @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
+        registry_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(registries)")
+        }
+        if "config_data_count" not in registry_columns:
+            connection.execute(
+                "ALTER TABLE registries ADD COLUMN config_data_count INTEGER NOT NULL DEFAULT 0"
+            )
         review_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(review_runs)")
         }
@@ -228,12 +236,15 @@ class StateStore:
         now = utc_now()
         with self.transaction() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO registries VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO registries "
+                "(digest, baseline_commit, classification_sha256, in_scope_count, "
+                "config_data_count, imported_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     registry.digest,
                     registry.baseline_commit,
                     registry.classification_sha256,
                     registry.in_scope_count,
+                    registry.config_data_count,
                     now,
                 ),
             )

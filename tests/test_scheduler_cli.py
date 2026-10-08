@@ -14,12 +14,23 @@ from scheduler.registry import with_revision_digest
 from scheduler.state_store import StateStore
 
 
-def write_fixture(root: Path, *, count: int = 1) -> tuple[Path, Path]:
+def write_fixture(
+    root: Path, *, count: int = 1, config_count: int = 0
+) -> tuple[Path, Path]:
     classification = root / "classification.json"
     entries = [
         {"path": f"source-{index}.py", "disposition": "in_scope", "capability": "test"}
         for index in range(count)
     ]
+    config_entries = [
+        {
+            "path": f"config-{index}.json",
+            "disposition": "config_data",
+            "capability": "test",
+        }
+        for index in range(config_count)
+    ]
+    entries.extend(config_entries)
     content = json.dumps(entries, separators=(",", ":")).encode()
     classification.write_bytes(content)
     rfc = with_revision_digest(
@@ -28,10 +39,16 @@ def write_fixture(root: Path, *, count: int = 1) -> tuple[Path, Path]:
             "title": "Fixture",
             "capability_group": "test",
             "revision": 1,
-            "python_sources": [entry["path"] for entry in entries],
-            "target_files": ["src/fixture.ts"],
+            "python_sources": [entry["path"] for entry in entries if entry["disposition"] == "in_scope"],
+            "config_sources": [entry["path"] for entry in config_entries],
+            "target_files": ["src/fixture.ts", "config/fixture.json"],
             "source_targets": {
-                entry["path"]: "src/fixture.ts" for entry in entries
+                entry["path"]: "src/fixture.ts"
+                for entry in entries
+                if entry["disposition"] == "in_scope"
+            },
+            "config_targets": {
+                entry["path"]: "config/fixture.json" for entry in config_entries
             },
             "lock_keys": ["fixture"],
             "depends_on": [],
@@ -51,6 +68,7 @@ def write_fixture(root: Path, *, count: int = 1) -> tuple[Path, Path]:
                     "classification_sha256": "sha256:"
                     + hashlib.sha256(content).hexdigest(),
                     "in_scope_count": count,
+                    "config_data_count": config_count,
                 },
                 "rfcs": [rfc],
             }
@@ -99,12 +117,23 @@ class SchedulerCliTests(unittest.TestCase):
 
     def test_production_mode_accepts_an_exact_806_partition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            dag, classification = write_fixture(Path(directory), count=806)
+            dag, classification = write_fixture(
+                Path(directory), count=806, config_count=188
+            )
             code, stdout, stderr = self.invoke(
                 ["validate", str(dag), str(classification)]
             )
         self.assertEqual(code, 0, stderr)
         self.assertTrue(json.loads(stdout)["valid"])
+
+    def test_production_mode_rejects_missing_config_data_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dag, classification = write_fixture(Path(directory), count=806)
+            code, _stdout, stderr = self.invoke(
+                ["validate", str(dag), str(classification)]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("production 188-path config-data partition", stderr)
 
     def test_test_mode_explicitly_allows_a_synthetic_partition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

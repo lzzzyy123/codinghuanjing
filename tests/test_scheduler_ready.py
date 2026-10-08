@@ -67,6 +67,7 @@ class ReadinessTests(unittest.TestCase):
                             "commit": "a" * 40,
                             "classification_sha256": "sha256:" + "b" * 64,
                             "in_scope_count": 806,
+                            "config_data_count": 0,
                         },
                         "rfcs": [first, second],
                     }
@@ -112,6 +113,7 @@ class ReadinessTests(unittest.TestCase):
                             "commit": "a" * 40,
                             "classification_sha256": "sha256:" + "b" * 64,
                             "in_scope_count": 1,
+                            "config_data_count": 0,
                         },
                         "base_delivery": {
                             "rfc": "RFC-20261008-055",

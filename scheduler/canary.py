@@ -69,6 +69,7 @@ def run_canary(root: Path) -> dict[str, object]:
                     "commit": "a" * 40,
                     "classification_sha256": "sha256:" + "b" * 64,
                     "in_scope_count": 7,
+                    "config_data_count": 0,
                 },
                 "rfcs": rfcs,
             }

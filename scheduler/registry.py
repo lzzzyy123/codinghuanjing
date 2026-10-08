@@ -77,8 +77,10 @@ class RfcRevision:
     revision: int
     revision_digest: str
     python_sources: tuple[str, ...]
+    config_sources: tuple[str, ...]
     target_files: tuple[str, ...]
     source_targets: dict[str, str]
+    config_targets: dict[str, str]
     lock_keys: tuple[str, ...]
     depends_on: tuple[str, ...]
     provides: dict[str, str]
@@ -97,6 +99,7 @@ class Registry:
     baseline_commit: str
     classification_sha256: str
     in_scope_count: int
+    config_data_count: int
     baseline_tree: str | None
     base_delivery_rfc: str | None
     base_delivery_commit: str | None
@@ -150,6 +153,14 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
     source_digest = value.get("source_files_sha256")
     if source_digest is not None and source_digest != content_digest(list(sources)):
         raise RegistryError(f"{rfc_id}.source_files_sha256 mismatch")
+    config_sources = tuple(
+        normalized_relative_path(item, f"{rfc_id}.config_sources")
+        for item in string_list(
+            value.get("config_sources", []),
+            f"{rfc_id}.config_sources",
+            non_empty=False,
+        )
+    )
     targets = tuple(
         normalized_relative_path(item, f"{rfc_id}.target_files")
         for item in string_list(value.get("target_files"), f"{rfc_id}.target_files")
@@ -173,6 +184,27 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
     if undeclared_targets:
         raise RegistryError(
             f"{rfc_id}.source_targets references undeclared targets: {undeclared_targets[:10]}"
+        )
+    config_targets_value = value.get("config_targets", {})
+    if not isinstance(config_targets_value, dict):
+        raise RegistryError(f"{rfc_id}.config_targets must be an object")
+    config_targets: dict[str, str] = {}
+    for source, target in config_targets_value.items():
+        normalized_source = normalized_relative_path(source, f"{rfc_id}.config_targets")
+        normalized_target = normalized_relative_path(target, f"{rfc_id}.config_targets")
+        config_targets[normalized_source] = normalized_target
+    if set(config_targets) != set(config_sources):
+        missing = sorted(set(config_sources) - set(config_targets))
+        extra = sorted(set(config_targets) - set(config_sources))
+        raise RegistryError(
+            f"{rfc_id}.config_targets must map every config source exactly once; "
+            f"missing={missing[:10]}, extra={extra[:10]}"
+        )
+    undeclared_config_targets = sorted(set(config_targets.values()) - set(targets))
+    if undeclared_config_targets:
+        raise RegistryError(
+            f"{rfc_id}.config_targets references undeclared targets: "
+            f"{undeclared_config_targets[:10]}"
         )
     lock_keys = string_list(
         value.get("lock_keys"), f"{rfc_id}.lock_keys"
@@ -220,8 +252,10 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         revision=revision,
         revision_digest=digest,
         python_sources=sources,
+        config_sources=config_sources,
         target_files=targets,
         source_targets=source_targets,
+        config_targets=config_targets,
         lock_keys=lock_keys,
         depends_on=dependencies,
         provides=provides,
@@ -316,6 +350,7 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
     tree = baseline.get("tree")
     classification = baseline.get("classification_sha256")
     count = baseline.get("in_scope_count")
+    config_count = baseline.get("config_data_count")
     if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
         raise RegistryError("baseline.commit must be a full Git SHA")
     if tree is not None and (not isinstance(tree, str) or not COMMIT_RE.fullmatch(tree)):
@@ -324,6 +359,8 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
         raise RegistryError("baseline.classification_sha256 must be a sha256 digest")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         raise RegistryError("baseline.in_scope_count must be a positive integer")
+    if not isinstance(config_count, int) or isinstance(config_count, bool) or config_count < 0:
+        raise RegistryError("baseline.config_data_count must be a non-negative integer")
     values = document.get("rfcs")
     if not isinstance(values, list) or not values:
         raise RegistryError("rfcs must be a non-empty list")
@@ -333,12 +370,14 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
         raise RegistryError("RFC IDs must be unique")
     order = _topological_order(rfcs)
     _validate_unique_ownership(parsed, "python_sources")
+    _validate_unique_ownership(parsed, "config_sources")
     _validate_unique_ownership(parsed, "target_files")
     registry = Registry(
         schema_version=1,
         baseline_commit=commit,
         classification_sha256=classification,
         in_scope_count=count,
+        config_data_count=config_count,
         baseline_tree=tree,
         base_delivery_rfc=None,
         base_delivery_commit=None,
@@ -380,12 +419,20 @@ def validate_exact_partition(registry: Registry, classification_path: Path) -> N
     if not isinstance(classification, list):
         raise RegistryError("classification root must be a list")
     expected: set[str] = set()
+    expected_config: set[str] = set()
     for index, entry in enumerate(classification):
         if not isinstance(entry, dict):
             raise RegistryError(f"classification[{index}] must be an object")
         if entry.get("disposition") == "in_scope":
             expected.add(normalized_relative_path(entry.get("path"), "classification.path"))
+        elif entry.get("disposition") == "config_data":
+            expected_config.add(
+                normalized_relative_path(entry.get("path"), "classification.path")
+            )
     actual = {path for rfc in registry.rfcs.values() for path in rfc.python_sources}
+    actual_config = {
+        path for rfc in registry.rfcs.values() for path in rfc.config_sources
+    }
     if len(expected) != registry.in_scope_count:
         raise RegistryError(
             f"classification contains {len(expected)} in-scope paths, expected {registry.in_scope_count}"
@@ -395,6 +442,17 @@ def validate_exact_partition(registry: Registry, classification_path: Path) -> N
         extra = sorted(actual - expected)
         raise RegistryError(
             f"RFC source partition mismatch; missing={missing[:10]}, extra={extra[:10]}"
+        )
+    if len(expected_config) != registry.config_data_count:
+        raise RegistryError(
+            f"classification contains {len(expected_config)} config-data paths, "
+            f"expected {registry.config_data_count}"
+        )
+    if actual_config != expected_config:
+        missing = sorted(expected_config - actual_config)
+        extra = sorted(actual_config - expected_config)
+        raise RegistryError(
+            f"RFC config-data partition mismatch; missing={missing[:10]}, extra={extra[:10]}"
         )
 
 

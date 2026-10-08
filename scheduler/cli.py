@@ -15,6 +15,7 @@ from .status import status_snapshot
 
 
 PRODUCTION_IN_SCOPE_COUNT = 806
+PRODUCTION_CONFIG_DATA_COUNT = 188
 
 
 def parser() -> argparse.ArgumentParser:
@@ -67,6 +68,11 @@ def _load_validated_registry(
         root.error(
             f"{args.command} requires the production {PRODUCTION_IN_SCOPE_COUNT}-path "
             f"partition, registry declares {registry.in_scope_count}"
+        )
+    if not args.test_mode and registry.config_data_count != PRODUCTION_CONFIG_DATA_COUNT:
+        root.error(
+            f"{args.command} requires the production {PRODUCTION_CONFIG_DATA_COUNT}-path "
+            f"config-data partition, registry declares {registry.config_data_count}"
         )
     return registry
 

@@ -46,6 +46,10 @@ def status_snapshot(registry: Registry, store: StateStore) -> dict[str, Any]:
     return {
         "registry_digest": registry.digest,
         "baseline_commit": registry.baseline_commit,
+        "source_coverage": {
+            "in_scope": registry.in_scope_count,
+            "config_data": registry.config_data_count,
+        },
         "task_counts": state_counts,
         "capabilities": {
             group: dict(sorted(counts.items())) for group, counts in sorted(capability.items())

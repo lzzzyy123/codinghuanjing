@@ -46,6 +46,7 @@ class DaemonTests(unittest.TestCase):
                             "classification_sha256": "sha256:"
                             + hashlib.sha256(content).hexdigest(),
                             "in_scope_count": 1,
+                            "config_data_count": 0,
                         },
                         "rfcs": [with_revision_digest(rfc)],
                     }
