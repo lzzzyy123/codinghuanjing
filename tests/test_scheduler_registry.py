@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from scheduler.registry import RegistryError, load_registry, with_revision_digest
+
+
+CONTRACT = "sha256:" + "1" * 64
+
+
+def rfc(rfc_id: str, source: str, target: str, **changes: object) -> dict:
+    value = {
+        "id": rfc_id,
+        "title": rfc_id,
+        "capability_group": "test",
+        "revision": 1,
+        "python_sources": [source],
+        "target_files": [target],
+        "depends_on": [],
+        "contracts": {"provides": {}, "requires": {}},
+        "tests": {"level1": ["bun run typecheck"], "level2": ["bun test"]},
+        "integration_batch": "batch-1",
+        "acceptance_criteria": ["Mapped behavior is equivalent."],
+    }
+    value.update(changes)
+    return with_revision_digest(value)
+
+
+def document(rfcs: list[dict]) -> dict:
+    return {
+        "schema_version": 1,
+        "baseline": {
+            "commit": "a" * 40,
+            "classification_sha256": "sha256:" + "b" * 64,
+            "in_scope_count": 806,
+        },
+        "rfcs": rfcs,
+    }
+
+
+def load(value: dict):
+    temporary = tempfile.TemporaryDirectory()
+    try:
+        path = Path(temporary.name) / "dag.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return load_registry(path)
+    finally:
+        temporary.cleanup()
+
+
+class RegistryTests(unittest.TestCase):
+    def test_loads_content_addressed_dag_and_contract(self) -> None:
+        first = rfc(
+            "RFC-20261008-056",
+            "hermes/agent/a.py",
+            "src/agent/a.ts",
+            contracts={"provides": {"agent.request": CONTRACT}, "requires": {}},
+        )
+        second = rfc(
+            "RFC-20261008-057",
+            "hermes/agent/b.py",
+            "src/agent/b.ts",
+            depends_on=[first["id"]],
+            contracts={"provides": {}, "requires": {"agent.request": CONTRACT}},
+        )
+        registry = load(document([second, first]))
+        self.assertEqual(registry.topological_order, (first["id"], second["id"]))
+        self.assertEqual(registry.ancestors(second["id"]), {first["id"]})
+
+    def test_rejects_digest_mutation(self) -> None:
+        value = rfc("RFC-20261008-056", "a.py", "a.ts")
+        value["title"] = "mutated"
+        with self.assertRaisesRegex(RegistryError, "revision_digest mismatch"):
+            load(document([value]))
+
+    def test_rejects_cycles(self) -> None:
+        first = rfc(
+            "RFC-20261008-056", "a.py", "a.ts", depends_on=["RFC-20261008-057"]
+        )
+        second = rfc(
+            "RFC-20261008-057", "b.py", "b.ts", depends_on=["RFC-20261008-056"]
+        )
+        with self.assertRaisesRegex(RegistryError, "dependency cycle"):
+            load(document([first, second]))
+
+    def test_rejects_source_and_target_ownership_collisions(self) -> None:
+        first = rfc("RFC-20261008-056", "same.py", "a.ts")
+        second = rfc("RFC-20261008-057", "same.py", "b.ts")
+        with self.assertRaisesRegex(RegistryError, "ownership collision"):
+            load(document([first, second]))
+
+    def test_rejects_contract_hash_mismatch(self) -> None:
+        first = rfc(
+            "RFC-20261008-056",
+            "a.py",
+            "a.ts",
+            contracts={"provides": {"contract": CONTRACT}, "requires": {}},
+        )
+        second = rfc(
+            "RFC-20261008-057",
+            "b.py",
+            "b.ts",
+            depends_on=[first["id"]],
+            contracts={
+                "provides": {},
+                "requires": {"contract": "sha256:" + "2" * 64},
+            },
+        )
+        with self.assertRaisesRegex(RegistryError, "provider has"):
+            load(document([first, second]))
+
+
+if __name__ == "__main__":
+    unittest.main()
