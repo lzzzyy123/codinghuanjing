@@ -5,7 +5,7 @@ BASE=/openbayes/home/coding-worker
 CONFIG="$BASE/config/worker.env"
 
 usage() {
-    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|wait-rfc|retry-review|record-pr|enqueue-amendment}"
+    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|wait-rfc|retry-review|record-pr|enqueue-amendment|scheduler-validate|scheduler-init|scheduler-status|scheduler-history|scheduler-replay|scheduler-recover}"
 }
 
 load_config() {
@@ -92,6 +92,36 @@ case "${1:-}" in
         load_config
         [ "$#" -eq 3 ] || { usage; exit 2; }
         "$BASE/.venv/bin/python" "$BASE/worker/control.py" enqueue-upload "$2" "$3"
+        ;;
+    scheduler-validate)
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli validate "$2"
+        ;;
+    scheduler-init)
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli init "$2" "$3"
+        ;;
+    scheduler-status)
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli status "$2" "$3"
+        ;;
+    scheduler-history)
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli history "$2" "$3"
+        ;;
+    scheduler-replay)
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli replay "$2"
+        ;;
+    scheduler-recover)
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli recover "$2"
         ;;
     *)
         usage
