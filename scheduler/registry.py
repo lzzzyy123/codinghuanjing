@@ -78,9 +78,12 @@ class RfcRevision:
     revision_digest: str
     python_sources: tuple[str, ...]
     target_files: tuple[str, ...]
+    source_targets: dict[str, str]
+    lock_keys: tuple[str, ...]
     depends_on: tuple[str, ...]
     provides: dict[str, str]
     requires: dict[str, str]
+    contract_definitions: dict[str, Any]
     level1_tests: tuple[str, ...]
     level2_tests: tuple[str, ...]
     integration_batch: str
@@ -151,6 +154,29 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         normalized_relative_path(item, f"{rfc_id}.target_files")
         for item in string_list(value.get("target_files"), f"{rfc_id}.target_files")
     )
+    source_targets_value = value.get("source_targets")
+    if not isinstance(source_targets_value, dict):
+        raise RegistryError(f"{rfc_id}.source_targets must be an object")
+    source_targets: dict[str, str] = {}
+    for source, target in source_targets_value.items():
+        normalized_source = normalized_relative_path(source, f"{rfc_id}.source_targets")
+        normalized_target = normalized_relative_path(target, f"{rfc_id}.source_targets")
+        source_targets[normalized_source] = normalized_target
+    if set(source_targets) != set(sources):
+        missing = sorted(set(sources) - set(source_targets))
+        extra = sorted(set(source_targets) - set(sources))
+        raise RegistryError(
+            f"{rfc_id}.source_targets must map every owned source exactly once; "
+            f"missing={missing[:10]}, extra={extra[:10]}"
+        )
+    undeclared_targets = sorted(set(source_targets.values()) - set(targets))
+    if undeclared_targets:
+        raise RegistryError(
+            f"{rfc_id}.source_targets references undeclared targets: {undeclared_targets[:10]}"
+        )
+    lock_keys = string_list(
+        value.get("lock_keys"), f"{rfc_id}.lock_keys"
+    )
     dependencies = string_list(
         value.get("depends_on", []), f"{rfc_id}.depends_on", non_empty=False
     )
@@ -161,6 +187,18 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         raise RegistryError(f"{rfc_id}.contracts must be an object")
     provides = contract_map(contracts.get("provides", {}), f"{rfc_id}.contracts.provides")
     requires = contract_map(contracts.get("requires", {}), f"{rfc_id}.contracts.requires")
+    definitions = contracts.get("definitions")
+    if not isinstance(definitions, dict):
+        raise RegistryError(f"{rfc_id}.contracts.definitions must be an object")
+    if set(definitions) != set(provides):
+        raise RegistryError(
+            f"{rfc_id}.contracts.definitions must exactly match provided contracts"
+        )
+    for name, definition in definitions.items():
+        if content_digest(definition) != provides[name]:
+            raise RegistryError(
+                f"{rfc_id}.contracts.definitions.{name} does not match its hash"
+            )
     tests = value.get("tests")
     if not isinstance(tests, dict):
         raise RegistryError(f"{rfc_id}.tests must be an object")
@@ -183,9 +221,12 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         revision_digest=digest,
         python_sources=sources,
         target_files=targets,
+        source_targets=source_targets,
+        lock_keys=lock_keys,
         depends_on=dependencies,
         provides=provides,
         requires=requires,
+        contract_definitions=dict(definitions),
         level1_tests=level1,
         level2_tests=level2,
         integration_batch=batch.strip(),

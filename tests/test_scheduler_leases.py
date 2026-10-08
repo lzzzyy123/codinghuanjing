@@ -21,9 +21,10 @@ def setup(root: Path) -> tuple[StateStore, QueueStore]:
             "revision": 1,
             "python_sources": ["hermes/agent.py"],
             "target_files": ["src/agent.ts"],
+            "source_targets": {"hermes/agent.py": "src/agent.ts"},
             "lock_keys": ["shared-registry"],
             "depends_on": [],
-            "contracts": {"provides": {}, "requires": {}},
+            "contracts": {"provides": {}, "requires": {}, "definitions": {}},
             "tests": {"level1": ["bun run typecheck"], "level2": ["bun test"]},
             "integration_batch": "agent",
             "acceptance_criteria": ["Equivalent."],
@@ -183,6 +184,7 @@ class LeaseTests(unittest.TestCase):
                     "title": "Second",
                     "python_sources": ["hermes/second.py"],
                     "target_files": ["src/second.ts"],
+                    "source_targets": {"hermes/second.py": "src/second.ts"},
                 }
             )
             dag = root / "dag-two.json"

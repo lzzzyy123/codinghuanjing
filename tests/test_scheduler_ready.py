@@ -6,12 +6,13 @@ import unittest
 from pathlib import Path
 
 from scheduler.models import TaskState
-from scheduler.registry import load_registry, with_revision_digest
+from scheduler.registry import content_digest, load_registry, with_revision_digest
 from scheduler.scheduler import DagScheduler
 from scheduler.state_store import StateConflict, StateStore
 
 
-CONTRACT = "sha256:" + "c" * 64
+CONTRACT_DEFINITION = {"schema": "agent-core-v1"}
+CONTRACT = content_digest(CONTRACT_DEFINITION)
 
 
 def item(rfc_id: str, number: int, **changes: object) -> dict:
@@ -22,8 +23,10 @@ def item(rfc_id: str, number: int, **changes: object) -> dict:
         "revision": 1,
         "python_sources": [f"hermes/{number}.py"],
         "target_files": [f"src/{number}.ts"],
+        "source_targets": {f"hermes/{number}.py": f"src/{number}.ts"},
+        "lock_keys": [f"fixture:{number}"],
         "depends_on": [],
-        "contracts": {"provides": {}, "requires": {}},
+        "contracts": {"provides": {}, "requires": {}, "definitions": {}},
         "tests": {"level1": ["bun run typecheck"], "level2": ["bun test"]},
         "integration_batch": "agent",
         "acceptance_criteria": ["Equivalent."],
@@ -39,13 +42,21 @@ class ReadinessTests(unittest.TestCase):
             first = item(
                 "RFC-20261008-056",
                 1,
-                contracts={"provides": {"agent.core": CONTRACT}, "requires": {}},
+                contracts={
+                    "provides": {"agent.core": CONTRACT},
+                    "requires": {},
+                    "definitions": {"agent.core": CONTRACT_DEFINITION},
+                },
             )
             second = item(
                 "RFC-20261008-057",
                 2,
                 depends_on=[first["id"]],
-                contracts={"provides": {}, "requires": {"agent.core": CONTRACT}},
+                contracts={
+                    "provides": {},
+                    "requires": {"agent.core": CONTRACT},
+                    "definitions": {},
+                },
             )
             path = root / "dag.json"
             path.write_text(

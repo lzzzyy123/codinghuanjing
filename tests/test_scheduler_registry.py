@@ -6,10 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scheduler.registry import RegistryError, load_registry, with_revision_digest
+from scheduler.registry import (
+    RegistryError,
+    content_digest,
+    load_registry,
+    with_revision_digest,
+)
 
 
-CONTRACT = "sha256:" + "1" * 64
+CONTRACT_DEFINITION = {"schema": "request"}
+CONTRACT = content_digest(CONTRACT_DEFINITION)
 
 
 def rfc(rfc_id: str, source: str, target: str, **changes: object) -> dict:
@@ -20,8 +26,10 @@ def rfc(rfc_id: str, source: str, target: str, **changes: object) -> dict:
         "revision": 1,
         "python_sources": [source],
         "target_files": [target],
+        "source_targets": {source: target},
+        "lock_keys": [f"rfc:{rfc_id}"],
         "depends_on": [],
-        "contracts": {"provides": {}, "requires": {}},
+        "contracts": {"provides": {}, "requires": {}, "definitions": {}},
         "tests": {"level1": ["bun run typecheck"], "level2": ["bun test"]},
         "integration_batch": "batch-1",
         "acceptance_criteria": ["Mapped behavior is equivalent."],
@@ -58,14 +66,22 @@ class RegistryTests(unittest.TestCase):
             "RFC-20261008-056",
             "hermes/agent/a.py",
             "src/agent/a.ts",
-            contracts={"provides": {"agent.request": CONTRACT}, "requires": {}},
+            contracts={
+                "provides": {"agent.request": CONTRACT},
+                "requires": {},
+                "definitions": {"agent.request": CONTRACT_DEFINITION},
+            },
         )
         second = rfc(
             "RFC-20261008-057",
             "hermes/agent/b.py",
             "src/agent/b.ts",
             depends_on=[first["id"]],
-            contracts={"provides": {}, "requires": {"agent.request": CONTRACT}},
+            contracts={
+                "provides": {},
+                "requires": {"agent.request": CONTRACT},
+                "definitions": {},
+            },
         )
         registry = load(document([second, first]))
         self.assertEqual(registry.topological_order, (first["id"], second["id"]))
@@ -98,7 +114,11 @@ class RegistryTests(unittest.TestCase):
             "RFC-20261008-056",
             "a.py",
             "a.ts",
-            contracts={"provides": {"contract": CONTRACT}, "requires": {}},
+            contracts={
+                "provides": {"contract": CONTRACT},
+                "requires": {},
+                "definitions": {"contract": CONTRACT_DEFINITION},
+            },
         )
         second = rfc(
             "RFC-20261008-057",
@@ -108,6 +128,7 @@ class RegistryTests(unittest.TestCase):
             contracts={
                 "provides": {},
                 "requires": {"contract": "sha256:" + "2" * 64},
+                "definitions": {},
             },
         )
         with self.assertRaisesRegex(RegistryError, "provider has"):
@@ -137,10 +158,32 @@ class RegistryTests(unittest.TestCase):
             registry = load_registry(path, classification)
             self.assertEqual(registry.in_scope_count, 1)
             value["rfcs"][0]["python_sources"] = ["missing.py"]
+            value["rfcs"][0]["source_targets"] = {"missing.py": "a.ts"}
             value["rfcs"][0] = with_revision_digest(value["rfcs"][0])
             path.write_text(json.dumps(value))
             with self.assertRaisesRegex(RegistryError, "source partition mismatch"):
                 load_registry(path, classification)
+
+    def test_rejects_incomplete_source_to_target_mapping(self) -> None:
+        value = rfc("RFC-20261008-056", "a.py", "a.ts")
+        value["source_targets"] = {}
+        value = with_revision_digest(value)
+        with self.assertRaisesRegex(RegistryError, "map every owned source"):
+            load(document([value]))
+
+    def test_rejects_contract_definition_that_does_not_match_hash(self) -> None:
+        value = rfc(
+            "RFC-20261008-056",
+            "a.py",
+            "a.ts",
+            contracts={
+                "provides": {"contract": CONTRACT},
+                "requires": {},
+                "definitions": {"contract": {"schema": "changed"}},
+            },
+        )
+        with self.assertRaisesRegex(RegistryError, "does not match its hash"):
+            load(document([value]))
 
 
 if __name__ == "__main__":

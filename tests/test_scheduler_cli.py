@@ -30,8 +30,12 @@ def write_fixture(root: Path, *, count: int = 1) -> tuple[Path, Path]:
             "revision": 1,
             "python_sources": [entry["path"] for entry in entries],
             "target_files": ["src/fixture.ts"],
+            "source_targets": {
+                entry["path"]: "src/fixture.ts" for entry in entries
+            },
+            "lock_keys": ["fixture"],
             "depends_on": [],
-            "contracts": {"provides": {}, "requires": {}},
+            "contracts": {"provides": {}, "requires": {}, "definitions": {}},
             "tests": {"level1": ["true"], "level2": ["true"]},
             "integration_batch": "test",
             "acceptance_criteria": ["Valid fixture."],
