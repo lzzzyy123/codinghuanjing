@@ -52,6 +52,8 @@ AGENT_TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "1800"))
 TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "1200"))
 GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "180"))
 FULL_REGRESSION_COMMAND = os.environ.get("FULL_REGRESSION_COMMAND", "").strip()
+PYTHON_BASELINE_ROOT = os.environ.get("PYTHON_BASELINE_ROOT", "").strip()
+PYTHON_BASELINE_COMMIT = os.environ.get("PYTHON_BASELINE_COMMIT", "").strip()
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "3"))
 MAX_CODER_CYCLES = int(os.environ.get("MAX_CODER_CYCLES", "5"))
 MAX_CONSECUTIVE_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_ERRORS", "3"))
@@ -404,6 +406,10 @@ def run_agent_once(role: str, prompt: str, cwd: Path, report_dir: Path, label: s
         "DISABLE_TELEMETRY": "1",
         "DISABLE_ERROR_REPORTING": "1",
     }
+    if PYTHON_BASELINE_ROOT:
+        env["HERMES_PYTHON_BASELINE_ROOT"] = PYTHON_BASELINE_ROOT
+    if PYTHON_BASELINE_COMMIT:
+        env["HERMES_PYTHON_BASELINE_COMMIT"] = PYTHON_BASELINE_COMMIT
     task_log(report_dir, f"Starting independent {role} process ({label})")
     result = execute(command, cwd, AGENT_TIMEOUT, input_text=prompt, env=env)
     raw_path = report_dir / "raw" / f"{label}.json"
@@ -467,6 +473,10 @@ def run_test_command(name: str, command: str, cwd: Path, report_dir: Path) -> Co
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "PYTHONPYCACHEPREFIX": f"{AGENT_HOME}/.cache/coding-worker/{report_dir.name}",
     }
+    if PYTHON_BASELINE_ROOT:
+        env["HERMES_PYTHON_BASELINE_ROOT"] = PYTHON_BASELINE_ROOT
+    if PYTHON_BASELINE_COMMIT:
+        env["HERMES_PYTHON_BASELINE_COMMIT"] = PYTHON_BASELINE_COMMIT
     result = execute(
         [*AGENT_RUNNER, "bash", "-lc", command], cwd, TEST_TIMEOUT, env=env
     )

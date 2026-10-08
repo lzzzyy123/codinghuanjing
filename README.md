@@ -118,6 +118,8 @@ build_command: ""
 
 At least one test/lint/build command is required. These are module-level acceptance gates run before each review. A root-controlled `FULL_REGRESSION_COMMAND`, when configured, runs only after Reviewer PASS and before commit/push; RFC authors cannot override it. If the RFC test command is byte-identical to the full command, its passing result is reused. The following fields are rejected: `project`, `repository`, `working_directory`, `base_branch`, and `branch`. The body describes WHAT, WHY, boundaries, acceptance criteria, constraints, tests, and rollback. RFC commands are trusted operator input and run as `codingagent` in the isolated worktree.
 
+Migration verification may additionally receive `HERMES_PYTHON_BASELINE_ROOT` and `HERMES_PYTHON_BASELINE_COMMIT` from root-owned Worker configuration. The source snapshot must be read-only to `codingagent`, must match the project's committed baseline identity, and is available only to Coder, Reviewer, and test processes; it is never copied into or used by the production Bun runtime.
+
 ## Daily Mac Flow
 
 Configure ignored `tools/client.env` from its example, then:

@@ -23,6 +23,8 @@ AGENT_CLI = os.environ.get("AGENT_CLI", "/openbayes/home/.local/bin/claude")
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "").rstrip("/")
 LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "")
 PRIVATE_KEY = BASE / "secrets" / "github_deploy_key"
+PYTHON_BASELINE_ROOT_VALUE = os.environ.get("PYTHON_BASELINE_ROOT", "").strip()
+PYTHON_BASELINE_COMMIT = os.environ.get("PYTHON_BASELINE_COMMIT", "").strip()
 
 failures = 0
 
@@ -176,6 +178,33 @@ if PRIVATE_KEY.exists():
 else:
     report("Deploy private key", "SKIP", "not generated while project is unbound")
 
+if not PYTHON_BASELINE_ROOT_VALUE and not PYTHON_BASELINE_COMMIT:
+    report("Python differential baseline", "SKIP", "not configured")
+elif not PYTHON_BASELINE_ROOT_VALUE or not re.fullmatch(r"[0-9a-f]{40}", PYTHON_BASELINE_COMMIT):
+    report("Python differential baseline", "FAIL", "root and exact 40-character commit are required")
+else:
+    python_baseline = Path(PYTHON_BASELINE_ROOT_VALUE)
+    required_baseline_file = python_baseline / "agent" / "message_content.py"
+    if not python_baseline.is_absolute() or not required_baseline_file.is_file():
+        report("Python differential baseline", "FAIL", "configured read-only source snapshot is missing")
+    else:
+        readable = command(
+            ["chpst", "-u", "codingagent:codingproject", "test", "-r", str(required_baseline_file)]
+        )
+        read_only = command(
+            ["chpst", "-u", "codingagent:codingproject", "test", "!", "-w", str(required_baseline_file)]
+        )
+        if command_check(
+            "Python differential baseline read access",
+            readable,
+            f"codingagent can read pinned {PYTHON_BASELINE_COMMIT[:12]}",
+        ):
+            command_check(
+                "Python differential baseline immutability",
+                read_only,
+                "codingagent cannot modify reference source",
+            )
+
 if PROJECT is None:
     report("Project binding", "SKIP", "Status: unbound; inbox processing is paused")
 else:
@@ -185,6 +214,18 @@ else:
         report("PROJECT_ROOT", "FAIL", f"not a Git repository: {PROJECT}")
     else:
         report("PROJECT_ROOT", "PASS", str(PROJECT))
+        metadata_path = PROJECT / "baseline" / "metadata.json"
+        try:
+            project_baseline = json.loads(metadata_path.read_text(encoding="utf-8"))
+            project_commit = project_baseline["baseline"]["commit"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            project_commit = None
+        if PYTHON_BASELINE_COMMIT:
+            report(
+                "Project/reference baseline identity",
+                "PASS" if project_commit == PYTHON_BASELINE_COMMIT else "FAIL",
+                "exact commit matches" if project_commit == PYTHON_BASELINE_COMMIT else "commit mismatch",
+            )
         metadata_check = command(
             [
                 "chpst",

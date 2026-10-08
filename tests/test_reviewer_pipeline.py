@@ -38,6 +38,20 @@ def actionable_review(original_issue: str = "Fix the defect") -> str:
 
 
 class ReviewerPipelineTests(unittest.TestCase):
+    def test_test_process_receives_only_configured_read_only_baseline_identity(self) -> None:
+        result = watcher.CommandResult("true", 0, "", "")
+        with tempfile.TemporaryDirectory() as directory:
+            report_dir = Path(directory) / "reports"
+            with (
+                mock.patch.object(watcher, "PYTHON_BASELINE_ROOT", "/reference/source"),
+                mock.patch.object(watcher, "PYTHON_BASELINE_COMMIT", "a" * 40),
+                mock.patch.object(watcher, "execute", return_value=result) as execute,
+            ):
+                watcher.run_test_command("test", "true", Path(directory), report_dir)
+        environment = execute.call_args.kwargs["env"]
+        self.assertEqual(environment["HERMES_PYTHON_BASELINE_ROOT"], "/reference/source")
+        self.assertEqual(environment["HERMES_PYTHON_BASELINE_COMMIT"], "a" * 40)
+
     def test_full_regression_reuses_identical_module_command(self) -> None:
         with mock.patch.object(watcher, "FULL_REGRESSION_COMMAND", "bun test"):
             passed, summary, status = watcher.run_full_regression(
