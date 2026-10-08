@@ -8,6 +8,7 @@ from pathlib import Path
 from scheduler.evidence import ArtifactStore
 from scheduler.registry import load_registry, with_revision_digest
 from scheduler.state_store import StateStore
+from scheduler.state_store import StateConflict
 from scheduler.testing import TestEvidenceStore
 
 
@@ -81,6 +82,20 @@ class TestingEvidenceTests(unittest.TestCase):
                 "a" * 40,
             )
             self.assertIsNone(tests.reusable_pass(changed))
+            with self.assertRaisesRegex(StateConflict, "do not match"):
+                tests.record(changed, "PASS", evidence)
+
+            wrong_baseline = tests.identity(
+                rfc["id"],
+                rfc["revision_digest"],
+                "sha256:" + "c" * 64,
+                2,
+                ["bun test"],
+                {"BUN_VERSION": "1.3.10"},
+                "d" * 40,
+            )
+            with self.assertRaisesRegex(StateConflict, "registry's Python baseline"):
+                tests.record(wrong_baseline, "PASS", evidence)
 
     def test_level_two_requires_python_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +110,34 @@ class TestingEvidenceTests(unittest.TestCase):
                     ["bun test"],
                     {},
                 )
+
+    def test_leased_test_evidence_rejects_unknown_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, rfc = store(root)
+            artifacts = ArtifactStore(state, root / "artifacts")
+            evidence = artifacts.put_text("test-log", "PASS")
+            tests = TestEvidenceStore(state)
+            identity = tests.identity(
+                rfc["id"],
+                rfc["revision_digest"],
+                "sha256:" + "c" * 64,
+                2,
+                ["bun test"],
+                {},
+                "a" * 40,
+            )
+            with state.transaction() as connection:
+                with self.assertRaisesRegex(StateConflict, "persisted Git candidate"):
+                    tests.record_in_transaction(
+                        connection,
+                        identity,
+                        "PASS",
+                        evidence,
+                        expected_rfc_id=rfc["id"],
+                        expected_revision_digest=rfc["revision_digest"],
+                        expected_candidate_digest=identity.candidate_digest,
+                    )
 
 
 if __name__ == "__main__":

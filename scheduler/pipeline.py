@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from .leases import JobLease, QueueStore
+from .git_broker import Candidate
 from .models import TaskState
 from .state_store import StateConflict, StateStore
 from .testing import TestEvidenceStore, TestIdentity
@@ -34,19 +35,33 @@ class Pipeline:
     def complete_coding(
         self,
         lease: JobLease,
-        candidate_digest: str,
+        candidate: Candidate,
         level1_identity: TestIdentity,
         evidence_digest: str,
         *,
         now: float | None = None,
     ) -> int:
+        candidate_digest = candidate.candidate_digest
         self._validate_candidate(lease, candidate_digest)
+        if (
+            candidate.rfc_id != lease.rfc_id
+            or candidate.revision_digest != lease.revision_digest
+            or candidate.base_commit != lease.base_commit
+        ):
+            raise StateConflict("coding completion candidate does not match its lease")
         if level1_identity.level != 1 or level1_identity.candidate_digest != candidate_digest:
             raise StateConflict("coding completion requires matching Level 1 evidence")
         return self.queue.finish_and_transition(
             lease,
             "passed",
-            {"candidate_digest": candidate_digest, "level1_evidence": evidence_digest},
+            {
+                "candidate_digest": candidate_digest,
+                "branch": candidate.branch,
+                "commit_sha": candidate.commit_sha,
+                "tree_sha": candidate.tree_sha,
+                "diff_digest": candidate.diff_digest,
+                "level1_evidence": evidence_digest,
+            },
             TaskState.CODING,
             TaskState.TESTING,
             reason="Coder candidate and Level 1 gates passed",

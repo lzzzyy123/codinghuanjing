@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import time
 import uuid
@@ -45,6 +46,7 @@ class JobLease:
     expires_at: float
     candidate_digest: str | None
     attempt: int
+    base_commit: str | None = None
 
 
 class LeaseError(StateConflict):
@@ -75,10 +77,21 @@ class QueueStore:
             raise ValueError("capacity must be positive")
         timestamp = time.time() if now is None else now
         with self.store.transaction() as connection:
+            existing = connection.execute(
+                "SELECT role, model, process_identity FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            if existing is not None and (
+                existing["role"] != role
+                or existing["model"] != model
+                or existing["process_identity"] != process_identity
+            ):
+                raise StateConflict(
+                    "agent role, model, and process identity are immutable; register a new agent_id"
+                )
             connection.execute(
                 "INSERT INTO agents VALUES (?, ?, ?, ?, 'idle', ?, ?, '{}') "
-                "ON CONFLICT(agent_id) DO UPDATE SET role=excluded.role, "
-                "model=excluded.model, process_identity=excluded.process_identity, "
+                "ON CONFLICT(agent_id) DO UPDATE SET "
                 "capacity=excluded.capacity, heartbeat_at=excluded.heartbeat_at",
                 (agent_id, role, model, process_identity, capacity, timestamp),
             )
@@ -102,6 +115,7 @@ class QueueStore:
         idempotency_key: str,
         *,
         candidate_digest: str | None = None,
+        base_commit: str | None = None,
         priority: int = 0,
         max_attempts: int = 3,
         available_at: float | None = None,
@@ -113,6 +127,10 @@ class QueueStore:
             raise ValueError("idempotency_key must be non-empty")
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
+        if kind in {"coding", "integration"} and (
+            base_commit is None or not re.fullmatch(r"[0-9a-f]{40}", base_commit)
+        ):
+            raise ValueError(f"{kind} jobs require a pinned base commit")
         now_text = utc_now()
         ready_at = time.time() if available_at is None else available_at
         with self.store.transaction() as connection:
@@ -123,6 +141,7 @@ class QueueStore:
                 role,
                 idempotency_key,
                 candidate_digest,
+                base_commit,
                 priority,
                 max_attempts,
                 ready_at,
@@ -166,21 +185,19 @@ class QueueStore:
                 f"WHERE jobs.role = ? AND jobs.kind IN ({placeholders}) "
                 "AND jobs.state = 'queued' AND jobs.available_at <= ? "
                 "AND jobs.revision_digest = tasks.revision_digest "
+                "AND (jobs.kind NOT IN ('coding', 'integration') OR jobs.base_commit IS NOT NULL) "
                 "AND jobs.attempt < jobs.max_attempts "
                 "ORDER BY jobs.priority DESC, jobs.job_id",
                 (role, *sorted(allowed_kinds), timestamp),
             ).fetchall()
-            active_locks: set[str] = set()
-            active_revisions = connection.execute(
-                "SELECT rfc_revisions.payload_json FROM leases "
-                "JOIN jobs ON jobs.job_id = leases.job_id "
-                "JOIN rfc_revisions ON rfc_revisions.revision_digest = jobs.revision_digest "
-                "WHERE leases.expires_at > ?",
-                (timestamp,),
-            ).fetchall()
-            for active_revision in active_revisions:
-                payload = json.loads(active_revision["payload_json"])
-                active_locks.update(str(item) for item in payload.get("lock_keys", []))
+            # Locks remain held even after lease expiry until recovery has
+            # fenced/stopped the old executor and deletes the lease. This
+            # prevents another RFC from overlapping an expired-but-running
+            # process on a shared resource.
+            active_locks = {
+                str(row["lock_key"])
+                for row in connection.execute("SELECT lock_key FROM lease_locks")
+            }
             job = next(
                 (
                     row
@@ -225,8 +242,30 @@ class QueueStore:
                         expires_at,
                     ),
                 )
+                for lock_key in sorted(
+                    self._revision_lock_keys(connection, str(job["revision_digest"]))
+                ):
+                    connection.execute(
+                        "INSERT INTO resource_fences VALUES ('lock', ?, 1) "
+                        "ON CONFLICT(resource_type, resource_id) DO UPDATE "
+                        "SET last_token = last_token + 1",
+                        (lock_key,),
+                    )
+                    lock_token = int(
+                        connection.execute(
+                            "SELECT last_token FROM resource_fences "
+                            "WHERE resource_type = 'lock' AND resource_id = ?",
+                            (lock_key,),
+                        ).fetchone()["last_token"]
+                    )
+                    connection.execute(
+                        "INSERT INTO lease_locks VALUES (?, ?, ?)",
+                        (lock_key, lease_id, lock_token),
+                    )
             except Exception as exc:
-                raise LeaseError(f"resource already leased: {resource_id}") from exc
+                raise LeaseError(
+                    f"RFC or shared resource is already leased: {resource_id}"
+                ) from exc
             changed = connection.execute(
                 "UPDATE jobs SET state = 'leased', attempt = attempt + 1, updated_at = ? "
                 "WHERE job_id = ? AND state = 'queued'",
@@ -260,6 +299,7 @@ class QueueStore:
                 expires_at=expires_at,
                 candidate_digest=job["candidate_digest"],
                 attempt=int(job["attempt"]) + 1,
+                base_commit=job["base_commit"],
             )
 
     def start(self, lease: JobLease, *, now: float | None = None) -> None:
@@ -389,6 +429,94 @@ class QueueStore:
             if task is None or task["state"] != expected.value:
                 found = None if task is None else task["state"]
                 raise StateConflict(f"{lease.rfc_id} expected {expected.value}, found {found}")
+            if lease.kind == "coding":
+                candidate_digest = str(result.get("candidate_digest", ""))
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_digest):
+                    raise StateConflict("coding result requires a candidate digest")
+                candidate_fields = {
+                    "branch": str(result.get("branch", "")),
+                    "commit_sha": str(result.get("commit_sha", "")),
+                    "tree_sha": str(result.get("tree_sha", "")),
+                    "diff_digest": str(result.get("diff_digest", "")),
+                }
+                if candidate_fields["branch"] != f"agent/{lease.rfc_id}":
+                    raise StateConflict("coding result requires the RFC candidate branch")
+                if not re.fullmatch(r"[0-9a-f]{40}", candidate_fields["commit_sha"]):
+                    raise StateConflict("coding result requires a candidate commit")
+                if not re.fullmatch(r"[0-9a-f]{40}", candidate_fields["tree_sha"]):
+                    raise StateConflict("coding result requires a candidate tree")
+                if not re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", candidate_fields["diff_digest"]
+                ):
+                    raise StateConflict("coding result requires a candidate diff digest")
+                if lease.base_commit is None:
+                    raise StateConflict("coding result requires the pinned base commit")
+                candidate_evidence = {
+                    "base_commit": lease.base_commit,
+                    "branch": candidate_fields["branch"],
+                    "commit_sha": candidate_fields["commit_sha"],
+                    "diff_digest": candidate_fields["diff_digest"],
+                    "revision_digest": lease.revision_digest,
+                    "rfc_id": lease.rfc_id,
+                    "tree_sha": candidate_fields["tree_sha"],
+                }
+                expected_candidate_digest = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        candidate_evidence,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("ascii")
+                ).hexdigest()
+                if candidate_digest != expected_candidate_digest:
+                    raise StateConflict("candidate digest is not canonical for its Git evidence")
+                agent = connection.execute(
+                    "SELECT process_identity FROM agents WHERE agent_id = ?",
+                    (lease.holder_agent_id,),
+                ).fetchone()
+                if agent is None:
+                    raise StateConflict("candidate author agent is missing")
+                existing_candidate = connection.execute(
+                    "SELECT base_commit, branch, commit_sha, tree_sha, diff_digest, "
+                    "author_agent_id, author_process_identity "
+                    "FROM candidate_records "
+                    "WHERE rfc_id = ? AND revision_digest = ? AND candidate_digest = ?",
+                    (lease.rfc_id, lease.revision_digest, candidate_digest),
+                ).fetchone()
+                identity = (lease.holder_agent_id, str(agent["process_identity"]))
+                if existing_candidate is not None and (
+                    existing_candidate["base_commit"] != lease.base_commit
+                    or existing_candidate["branch"] != candidate_fields["branch"]
+                    or existing_candidate["commit_sha"] != candidate_fields["commit_sha"]
+                    or existing_candidate["tree_sha"] != candidate_fields["tree_sha"]
+                    or existing_candidate["diff_digest"] != candidate_fields["diff_digest"]
+                    or (
+                        existing_candidate["author_agent_id"],
+                        existing_candidate["author_process_identity"],
+                    )
+                    != identity
+                ):
+                    raise StateConflict("candidate digest already has a different author")
+                connection.execute(
+                    "INSERT OR IGNORE INTO candidate_records "
+                    "(rfc_id, revision_digest, candidate_digest, base_commit, branch, "
+                    "commit_sha, tree_sha, diff_digest, author_agent_id, "
+                    "author_process_identity, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        lease.rfc_id,
+                        lease.revision_digest,
+                        candidate_digest,
+                        str(lease.base_commit),
+                        candidate_fields["branch"],
+                        candidate_fields["commit_sha"],
+                        candidate_fields["tree_sha"],
+                        candidate_fields["diff_digest"],
+                        identity[0],
+                        identity[1],
+                        utc_now(),
+                    ),
+                )
             if test_record is not None:
                 identity, test_status, evidence_digest = test_record
                 TestEvidenceStore.record_in_transaction(
@@ -411,6 +539,7 @@ class QueueStore:
                     raise StateConflict("review evidence requires an independent Reviewer lease")
                 if review_record["candidate_digest"] != lease.candidate_digest:
                     raise StateConflict("review candidate does not match the leased job")
+                self._assert_independent_reviewer(connection, lease)
                 connection.execute(
                     "INSERT INTO review_runs "
                     "(rfc_id, revision_digest, candidate_digest, reviewer_agent_id, verdict, "
@@ -452,6 +581,7 @@ class QueueStore:
                     next_role,
                     next_idempotency_key,
                     next_candidate_digest,
+                    lease.base_commit,
                     next_priority,
                     next_max_attempts,
                     timestamp,
@@ -486,6 +616,7 @@ class QueueStore:
                 raise LeaseError("Reviewer infrastructure retry requires a running Reviewer job")
             if review_record["candidate_digest"] != lease.candidate_digest:
                 raise StateConflict("review candidate does not match the leased job")
+            self._assert_independent_reviewer(connection, lease)
             task = connection.execute(
                 "SELECT state FROM tasks WHERE rfc_id = ?", (lease.rfc_id,)
             ).fetchone()
@@ -559,6 +690,27 @@ class QueueStore:
             )
             return None if exhausted else lease.job_id
 
+    @staticmethod
+    def _assert_independent_reviewer(connection, lease: JobLease) -> None:
+        candidate = connection.execute(
+            "SELECT author_agent_id, author_process_identity FROM candidate_records "
+            "WHERE rfc_id = ? AND revision_digest = ? AND candidate_digest = ?",
+            (lease.rfc_id, lease.revision_digest, lease.candidate_digest),
+        ).fetchone()
+        reviewer = connection.execute(
+            "SELECT process_identity FROM agents WHERE agent_id = ? AND role = 'reviewer'",
+            (lease.holder_agent_id,),
+        ).fetchone()
+        if candidate is None:
+            raise StateConflict("review requires a persisted candidate author identity")
+        if reviewer is None:
+            raise StateConflict("reviewer identity is missing")
+        if (
+            candidate["author_agent_id"] == lease.holder_agent_id
+            or candidate["author_process_identity"] == reviewer["process_identity"]
+        ):
+            raise StateConflict("Reviewer must be independent from the candidate author")
+
     def approve_reviewed_candidate(
         self,
         rfc_id: str,
@@ -581,10 +733,16 @@ class QueueStore:
                     f"{rfc_id} expected {TaskState.LEAD_REVIEW.value}, found {found}"
                 )
             review = connection.execute(
-                "SELECT review_run_id FROM review_runs WHERE rfc_id = ? "
+                "SELECT review_runs.review_run_id, candidate_records.base_commit "
+                "FROM review_runs JOIN candidate_records USING "
+                "(rfc_id, revision_digest, candidate_digest) WHERE review_runs.rfc_id = ? "
                 "AND revision_digest = ? AND candidate_digest = ? AND verdict = 'PASS' "
                 "AND infrastructure_status = 'PASS' AND schema_valid = 1 "
-                "AND independent = 1 ORDER BY review_run_id DESC LIMIT 1",
+                "AND independent = 1 AND candidate_records.branch IS NOT NULL "
+                "AND candidate_records.commit_sha IS NOT NULL "
+                "AND candidate_records.tree_sha IS NOT NULL "
+                "AND candidate_records.diff_digest IS NOT NULL "
+                "ORDER BY review_run_id DESC LIMIT 1",
                 (rfc_id, task["revision_digest"], candidate_digest),
             ).fetchone()
             if review is None:
@@ -610,6 +768,7 @@ class QueueStore:
                 "integrator",
                 idempotency_key,
                 candidate_digest,
+                str(review["base_commit"]),
                 0,
                 max_attempts,
                 timestamp,
@@ -627,6 +786,7 @@ class QueueStore:
         idempotency_key: str,
         *,
         candidate_digest: str | None = None,
+        base_commit: str | None = None,
         priority: int = 0,
         max_attempts: int = 3,
         available_at: float | None = None,
@@ -652,13 +812,20 @@ class QueueStore:
                 role,
                 idempotency_key,
                 candidate_digest,
+                base_commit,
                 priority,
                 max_attempts,
                 timestamp,
                 utc_now(),
             )
 
-    def recover_expired(self, *, now: float | None = None) -> list[int]:
+    def recover_expired(
+        self,
+        *,
+        confirmed_quiescent_lease_ids: set[str],
+        now: float | None = None,
+    ) -> list[int]:
+        """Recover expired work only after a supervisor proved each executor stopped."""
         timestamp = time.time() if now is None else now
         recovered: list[int] = []
         with self.store.transaction() as connection:
@@ -669,6 +836,16 @@ class QueueStore:
                 "WHERE leases.expires_at <= ? ORDER BY leases.job_id",
                 (timestamp,),
             ).fetchall()
+            unconfirmed = sorted(
+                str(row["lease_id"])
+                for row in rows
+                if str(row["lease_id"]) not in confirmed_quiescent_lease_ids
+            )
+            if unconfirmed:
+                raise LeaseError(
+                    "expired leases require supervisor quiescence proof before recovery: "
+                    + ", ".join(unconfirmed)
+                )
             for row in rows:
                 task = connection.execute(
                     "SELECT state FROM tasks WHERE rfc_id = ?", (row["rfc_id"],)
@@ -759,7 +936,7 @@ class QueueStore:
     def _validated_lease(self, connection, lease: JobLease, now: float):
         row = connection.execute(
             "SELECT leases.*, jobs.state, jobs.revision_digest, jobs.kind, jobs.role, "
-            "jobs.attempt, jobs.max_attempts, jobs.candidate_digest FROM leases "
+            "jobs.attempt, jobs.max_attempts, jobs.base_commit, jobs.candidate_digest FROM leases "
             "JOIN jobs ON jobs.job_id = leases.job_id WHERE leases.lease_id = ?",
             (lease.lease_id,),
         ).fetchone()
@@ -773,6 +950,7 @@ class QueueStore:
             or row["kind"] != lease.kind
             or row["role"] != lease.role
             or row["candidate_digest"] != lease.candidate_digest
+            or row["base_commit"] != lease.base_commit
         ):
             raise LeaseError("lease fencing validation failed")
         if float(row["expires_at"]) <= now:
@@ -798,11 +976,16 @@ class QueueStore:
         role: str,
         idempotency_key: str,
         candidate_digest: str | None,
+        base_commit: str | None,
         priority: int,
         max_attempts: int,
         available_at: float,
         now_text: str,
     ) -> int:
+        if kind in {"coding", "integration"} and (
+            base_commit is None or not re.fullmatch(r"[0-9a-f]{40}", base_commit)
+        ):
+            raise ValueError(f"{kind} jobs require a pinned base commit")
         task = connection.execute(
             "SELECT revision_digest FROM tasks WHERE rfc_id = ?", (rfc_id,)
         ).fetchone()
@@ -811,8 +994,8 @@ class QueueStore:
         connection.execute(
             "INSERT OR IGNORE INTO jobs "
             "(idempotency_key, rfc_id, revision_digest, kind, role, state, priority, "
-            "candidate_digest, max_attempts, available_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+            "base_commit, candidate_digest, max_attempts, available_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
             (
                 idempotency_key,
                 rfc_id,
@@ -820,6 +1003,7 @@ class QueueStore:
                 kind,
                 role,
                 priority,
+                base_commit,
                 candidate_digest,
                 max_attempts,
                 available_at,
@@ -828,7 +1012,7 @@ class QueueStore:
             ),
         )
         row = connection.execute(
-            "SELECT job_id, rfc_id, revision_digest, kind, candidate_digest "
+            "SELECT job_id, rfc_id, revision_digest, kind, base_commit, candidate_digest "
             "FROM jobs WHERE idempotency_key = ?",
             (idempotency_key,),
         ).fetchone()
@@ -837,6 +1021,7 @@ class QueueStore:
             or row["revision_digest"] != task["revision_digest"]
             or row["kind"] != kind
             or row["candidate_digest"] != candidate_digest
+            or row["base_commit"] != base_commit
         ):
             raise StateConflict(f"idempotency key reused with different job: {idempotency_key}")
         return int(row["job_id"])

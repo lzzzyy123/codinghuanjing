@@ -117,8 +117,25 @@ class TestEvidenceStore:
         for label, required, actual in expected:
             if required is not None and required != actual:
                 raise StateConflict(f"test {label} does not match the leased job")
+        if expected_candidate_digest is not None:
+            candidate = connection.execute(
+                "SELECT 1 FROM candidate_records WHERE rfc_id = ? "
+                "AND revision_digest = ? AND candidate_digest = ? "
+                "AND commit_sha IS NOT NULL AND tree_sha IS NOT NULL "
+                "AND diff_digest IS NOT NULL",
+                (
+                    identity.rfc_id,
+                    identity.revision_digest,
+                    identity.candidate_digest,
+                ),
+            ).fetchone()
+            if candidate is None:
+                raise StateConflict("test evidence requires a persisted Git candidate")
         revision = connection.execute(
-            "SELECT rfc_id FROM rfc_revisions WHERE revision_digest = ?",
+            "SELECT rfc_revisions.rfc_id, rfc_revisions.payload_json, "
+            "registries.baseline_commit FROM rfc_revisions "
+            "JOIN registries ON registries.digest = rfc_revisions.registry_digest "
+            "WHERE rfc_revisions.revision_digest = ?",
             (identity.revision_digest,),
         ).fetchone()
         if revision is None or revision["rfc_id"] != identity.rfc_id:
@@ -128,6 +145,20 @@ class TestEvidenceStore:
         ).fetchone()
         if task is None or task["revision_digest"] != identity.revision_digest:
             raise StateConflict("test revision is not the RFC's active revision")
+        payload = json.loads(revision["payload_json"])
+        expected_commands = payload.get("tests", {}).get(f"level{identity.level}")
+        if not isinstance(expected_commands, list) or not expected_commands:
+            raise StateConflict(
+                f"RFC revision does not declare Level {identity.level} test commands"
+            )
+        if identity.command_digest != digest_json(expected_commands):
+            raise StateConflict(
+                f"test commands do not match the RFC Level {identity.level} gate"
+            )
+        if identity.level == 1 and identity.baseline_commit is not None:
+            raise StateConflict("Level 1 evidence must not claim a Python baseline")
+        if identity.level >= 2 and identity.baseline_commit != revision["baseline_commit"]:
+            raise StateConflict("test evidence does not use the registry's Python baseline")
         start = started_at or utc_now()
         complete = completed_at or utc_now()
         values = (
