@@ -33,10 +33,12 @@ class IsolationLayout:
             os.chmod(path, 0o700)
         return AgentPaths(home, cache, logs)
 
-    def task_worktree(self, rfc_id: str) -> Path:
+    def task_worktree(self, rfc_id: str, fencing_token: int) -> Path:
         if not IDENTITY_RE.fullmatch(rfc_id):
             raise ValueError("invalid RFC identity")
-        return self.root / "worktrees" / rfc_id
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise ValueError("fencing token must be a positive integer")
+        return self.root / "worktrees" / rfc_id / f"fence-{fencing_token:020d}"
 
     def reviewer_snapshot(self, rfc_id: str, commit_sha: str) -> Path:
         if not IDENTITY_RE.fullmatch(rfc_id) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
