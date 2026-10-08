@@ -117,6 +117,41 @@ CREATE TABLE IF NOT EXISTS leases (
     expires_at REAL NOT NULL,
     UNIQUE(resource_type, resource_id)
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    digest TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    relative_path TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL,
+    redacted INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS test_runs (
+    test_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rfc_id TEXT NOT NULL REFERENCES tasks(rfc_id),
+    revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    candidate_digest TEXT NOT NULL,
+    level INTEGER NOT NULL,
+    command_digest TEXT NOT NULL,
+    environment_digest TEXT NOT NULL,
+    baseline_commit TEXT,
+    status TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    UNIQUE(rfc_id, revision_digest, candidate_digest, level, command_digest,
+           environment_digest, baseline_commit)
+);
+CREATE TABLE IF NOT EXISTS review_runs (
+    review_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rfc_id TEXT NOT NULL REFERENCES tasks(rfc_id),
+    revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    candidate_digest TEXT NOT NULL,
+    reviewer_agent_id TEXT NOT NULL,
+    verdict TEXT,
+    infrastructure_status TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
+    created_at TEXT NOT NULL
+);
 """
 
 

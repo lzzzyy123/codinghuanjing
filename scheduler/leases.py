@@ -115,43 +115,18 @@ class QueueStore:
         now_text = utc_now()
         ready_at = time.time() if available_at is None else available_at
         with self.store.transaction() as connection:
-            task = connection.execute(
-                "SELECT revision_digest FROM tasks WHERE rfc_id = ?", (rfc_id,)
-            ).fetchone()
-            if task is None:
-                raise KeyError(rfc_id)
-            connection.execute(
-                "INSERT OR IGNORE INTO jobs "
-                "(idempotency_key, rfc_id, revision_digest, kind, role, state, priority, "
-                "candidate_digest, max_attempts, available_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
-                (
-                    idempotency_key,
-                    rfc_id,
-                    task["revision_digest"],
-                    kind,
-                    role,
-                    priority,
-                    candidate_digest,
-                    max_attempts,
-                    ready_at,
-                    now_text,
-                    now_text,
-                ),
+            return self._enqueue_in_transaction(
+                connection,
+                rfc_id,
+                kind,
+                role,
+                idempotency_key,
+                candidate_digest,
+                priority,
+                max_attempts,
+                ready_at,
+                now_text,
             )
-            row = connection.execute(
-                "SELECT job_id, rfc_id, revision_digest, kind, candidate_digest "
-                "FROM jobs WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if (
-                row["rfc_id"] != rfc_id
-                or row["revision_digest"] != task["revision_digest"]
-                or row["kind"] != kind
-                or row["candidate_digest"] != candidate_digest
-            ):
-                raise StateConflict(f"idempotency key reused with different job: {idempotency_key}")
-            return int(row["job_id"])
 
     def claim(
         self,
@@ -365,6 +340,141 @@ class QueueStore:
                 ("busy" if active else "idle", lease.holder_agent_id),
             )
 
+    def finish_and_transition(
+        self,
+        lease: JobLease,
+        outcome: str,
+        result: dict[str, Any],
+        expected: TaskState,
+        target: TaskState,
+        *,
+        reason: str,
+        next_kind: str | None = None,
+        next_idempotency_key: str | None = None,
+        next_candidate_digest: str | None = None,
+        next_priority: int = 0,
+        next_max_attempts: int = 3,
+        review_record: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> int | None:
+        """Atomically publish a fenced result, transition, and enqueue its successor."""
+        if outcome not in {"passed", "failed", "cancelled"}:
+            raise ValueError("invalid job outcome")
+        if (next_kind is None) != (next_idempotency_key is None):
+            raise ValueError("next kind and idempotency key must be supplied together")
+        timestamp = time.time() if now is None else now
+        with self.store.transaction() as connection:
+            self._validated_lease(connection, lease, timestamp)
+            task = connection.execute(
+                "SELECT state FROM tasks WHERE rfc_id = ?", (lease.rfc_id,)
+            ).fetchone()
+            if task is None or task["state"] != expected.value:
+                found = None if task is None else task["state"]
+                raise StateConflict(f"{lease.rfc_id} expected {expected.value}, found {found}")
+            connection.execute(
+                "UPDATE jobs SET state = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
+                (outcome, json.dumps(result, sort_keys=True), utc_now(), lease.job_id),
+            )
+            if review_record is not None:
+                connection.execute(
+                    "INSERT INTO review_runs "
+                    "(rfc_id, revision_digest, candidate_digest, reviewer_agent_id, verdict, "
+                    "infrastructure_status, evidence_digest, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        lease.rfc_id,
+                        lease.revision_digest,
+                        review_record["candidate_digest"],
+                        lease.holder_agent_id,
+                        review_record.get("verdict"),
+                        review_record["infrastructure_status"],
+                        review_record["evidence_digest"],
+                        utc_now(),
+                    ),
+                )
+            self._transition_in_transaction(
+                connection,
+                lease.rfc_id,
+                expected,
+                target,
+                f"agent:{lease.holder_agent_id}",
+                reason,
+                {"job_id": lease.job_id, "fencing_token": lease.fencing_token},
+            )
+            next_job_id = None
+            if next_kind is not None and next_idempotency_key is not None:
+                next_role = next(
+                    (name for name, kinds in KINDS_BY_ROLE.items() if next_kind in kinds), None
+                )
+                if next_role is None:
+                    raise ValueError(f"invalid next job kind: {next_kind}")
+                next_job_id = self._enqueue_in_transaction(
+                    connection,
+                    lease.rfc_id,
+                    next_kind,
+                    next_role,
+                    next_idempotency_key,
+                    next_candidate_digest,
+                    next_priority,
+                    next_max_attempts,
+                    timestamp,
+                    utc_now(),
+                )
+            connection.execute("DELETE FROM leases WHERE lease_id = ?", (lease.lease_id,))
+            active = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM leases WHERE holder_agent_id = ?",
+                    (lease.holder_agent_id,),
+                ).fetchone()["count"]
+            )
+            connection.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ?",
+                ("busy" if active else "idle", lease.holder_agent_id),
+            )
+            return next_job_id
+
+    def transition_and_enqueue(
+        self,
+        rfc_id: str,
+        expected: TaskState,
+        target: TaskState,
+        actor: str,
+        reason: str,
+        kind: str,
+        idempotency_key: str,
+        *,
+        candidate_digest: str | None = None,
+        priority: int = 0,
+        max_attempts: int = 3,
+        available_at: float | None = None,
+    ) -> int:
+        role = next((name for name, kinds in KINDS_BY_ROLE.items() if kind in kinds), None)
+        if role is None:
+            raise ValueError(f"invalid job kind: {kind}")
+        timestamp = time.time() if available_at is None else available_at
+        with self.store.transaction() as connection:
+            self._transition_in_transaction(
+                connection,
+                rfc_id,
+                expected,
+                target,
+                actor,
+                reason,
+                {"candidate_digest": candidate_digest},
+            )
+            return self._enqueue_in_transaction(
+                connection,
+                rfc_id,
+                kind,
+                role,
+                idempotency_key,
+                candidate_digest,
+                priority,
+                max_attempts,
+                timestamp,
+                utc_now(),
+            )
+
     def recover_expired(self, *, now: float | None = None) -> list[int]:
         timestamp = time.time() if now is None else now
         recovered: list[int] = []
@@ -435,6 +545,57 @@ class QueueStore:
         if float(row["expires_at"]) <= now:
             raise LeaseError("lease has expired")
         return row
+
+    @staticmethod
+    def _enqueue_in_transaction(
+        connection,
+        rfc_id: str,
+        kind: str,
+        role: str,
+        idempotency_key: str,
+        candidate_digest: str | None,
+        priority: int,
+        max_attempts: int,
+        available_at: float,
+        now_text: str,
+    ) -> int:
+        task = connection.execute(
+            "SELECT revision_digest FROM tasks WHERE rfc_id = ?", (rfc_id,)
+        ).fetchone()
+        if task is None:
+            raise KeyError(rfc_id)
+        connection.execute(
+            "INSERT OR IGNORE INTO jobs "
+            "(idempotency_key, rfc_id, revision_digest, kind, role, state, priority, "
+            "candidate_digest, max_attempts, available_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                rfc_id,
+                task["revision_digest"],
+                kind,
+                role,
+                priority,
+                candidate_digest,
+                max_attempts,
+                available_at,
+                now_text,
+                now_text,
+            ),
+        )
+        row = connection.execute(
+            "SELECT job_id, rfc_id, revision_digest, kind, candidate_digest "
+            "FROM jobs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if (
+            row["rfc_id"] != rfc_id
+            or row["revision_digest"] != task["revision_digest"]
+            or row["kind"] != kind
+            or row["candidate_digest"] != candidate_digest
+        ):
+            raise StateConflict(f"idempotency key reused with different job: {idempotency_key}")
+        return int(row["job_id"])
 
     @staticmethod
     def _transition_in_transaction(
