@@ -90,13 +90,14 @@ def run_canary(root: Path) -> dict[str, object]:
             store.transition(rfc_id, TaskState.TESTING, TaskState.REVIEWING, "canary")
     queue = QueueStore(store)
     for rfc in rfcs[:4]:
-        queue.enqueue(rfc["id"], "coding", f"coding:{rfc['id']}", available_at=0)
+        queue.enqueue(rfc["id"], "coding", f"coding:{rfc['id']}", base_commit="a" * 40, available_at=0)
     for rfc in rfcs[4:6]:
         queue.enqueue(
             rfc["id"],
             "review",
             f"review:{rfc['id']}",
             candidate_digest="sha256:" + "c" * 64,
+            base_commit="a" * 40,
             available_at=0,
         )
     context = multiprocessing.get_context("spawn")
@@ -118,7 +119,7 @@ def run_canary(root: Path) -> dict[str, object]:
         raise RuntimeError(f"synthetic 4C+2R canary failed: {exit_codes}")
 
     crash_rfc = rfcs[6]["id"]
-    queue.enqueue(crash_rfc, "coding", f"coding:{crash_rfc}", available_at=0)
+    queue.enqueue(crash_rfc, "coding", f"coding:{crash_rfc}", base_commit="a" * 40, available_at=0)
     crashing = context.Process(
         target=_crashing_worker, args=(str(database), "coder-crash", 200.0)
     )
@@ -126,7 +127,18 @@ def run_canary(root: Path) -> dict[str, object]:
     crashing.join(20)
     if crashing.exitcode != 0:
         raise RuntimeError(f"crash injection process failed unexpectedly: {crashing.exitcode}")
-    recovered = queue.recover_expired(now=202.0)
+    with store.connect() as connection:
+        crashing_lease = connection.execute(
+            "SELECT leases.lease_id FROM leases JOIN jobs USING (job_id) "
+            "WHERE jobs.rfc_id = ?",
+            (crash_rfc,),
+        ).fetchone()
+    if crashing_lease is None:
+        raise RuntimeError("crash injection did not leave an active lease")
+    recovered = queue.recover_expired(
+        now=202.0,
+        confirmed_quiescent_lease_ids={crashing_lease["lease_id"]},
+    )
     queue.register_agent("coder-recovery", "coder", "synthetic", "pid:recovery", now=202.0)
     replacement = queue.claim("coder-recovery", now=202.0, lease_seconds=30)
     if replacement is None or replacement.rfc_id != crash_rfc:

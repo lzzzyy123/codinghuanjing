@@ -20,6 +20,16 @@ class RegistryError(ValueError):
     """The RFC registry is malformed or internally inconsistent."""
 
 
+@dataclass(frozen=True)
+class SharedResource:
+    name: str
+    files: tuple[str, ...]
+    writer: str
+    request_template: str
+    request_owner: str
+    application_stage: str
+
+
 def canonical_json(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -79,8 +89,10 @@ class RfcRevision:
     python_sources: tuple[str, ...]
     config_sources: tuple[str, ...]
     target_files: tuple[str, ...]
+    target_prefixes: tuple[str, ...]
     source_targets: dict[str, str]
     config_targets: dict[str, str]
+    shared_change_requests: dict[str, str]
     lock_keys: tuple[str, ...]
     depends_on: tuple[str, ...]
     provides: dict[str, str]
@@ -88,6 +100,7 @@ class RfcRevision:
     contract_definitions: dict[str, Any]
     level1_tests: tuple[str, ...]
     level2_tests: tuple[str, ...]
+    level3_tests: tuple[str, ...]
     integration_batch: str
     acceptance_criteria: tuple[str, ...]
     raw: dict[str, Any]
@@ -103,6 +116,8 @@ class Registry:
     baseline_tree: str | None
     base_delivery_rfc: str | None
     base_delivery_commit: str | None
+    shared_resources: dict[str, SharedResource]
+    frozen_control_paths: tuple[str, ...]
     rfcs: dict[str, RfcRevision]
     topological_order: tuple[str, ...]
     digest: str
@@ -134,6 +149,17 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
     revision = value.get("revision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise RegistryError(f"{rfc_id}.revision must be a positive integer")
+    supersedes = value.get("supersedes")
+    if revision == 1 and supersedes is not None:
+        raise RegistryError(f"{rfc_id} revision 1 cannot supersede another revision")
+    if revision > 1:
+        if not isinstance(supersedes, dict):
+            raise RegistryError(f"{rfc_id} revision {revision} requires supersedes lineage")
+        if supersedes.get("revision") != revision - 1:
+            raise RegistryError(f"{rfc_id}.supersedes.revision must be {revision - 1}")
+        predecessor = supersedes.get("revision_digest")
+        if not isinstance(predecessor, str) or not SHA256_RE.fullmatch(predecessor):
+            raise RegistryError(f"{rfc_id}.supersedes.revision_digest is invalid")
     digest = value.get("revision_digest")
     expected_digest = content_digest(revision_payload(value))
     if digest != expected_digest:
@@ -165,6 +191,28 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         normalized_relative_path(item, f"{rfc_id}.target_files")
         for item in string_list(value.get("target_files"), f"{rfc_id}.target_files")
     )
+    target_prefixes = tuple(
+        normalized_relative_path(item, f"{rfc_id}.target_prefixes")
+        for item in string_list(
+            value.get("target_prefixes", []),
+            f"{rfc_id}.target_prefixes",
+            non_empty=False,
+        )
+    )
+    shared_change_requests_value = value.get("shared_change_requests", {})
+    if not isinstance(shared_change_requests_value, dict):
+        raise RegistryError(f"{rfc_id}.shared_change_requests must be an object")
+    shared_change_requests = {
+        str(name): normalized_relative_path(
+            path, f"{rfc_id}.shared_change_requests.{name}"
+        )
+        for name, path in shared_change_requests_value.items()
+        if isinstance(name, str) and name.strip()
+    }
+    if len(shared_change_requests) != len(shared_change_requests_value):
+        raise RegistryError(
+            f"{rfc_id}.shared_change_requests contains an invalid resource name"
+        )
     source_targets_value = value.get("source_targets")
     if not isinstance(source_targets_value, dict):
         raise RegistryError(f"{rfc_id}.source_targets must be an object")
@@ -239,6 +287,9 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
             raise RegistryError(f"{rfc_id}.tests.{level} is required")
     level1 = string_list(tests["level1"], f"{rfc_id}.tests.level1")
     level2 = string_list(tests["level2"], f"{rfc_id}.tests.level2")
+    level3 = string_list(
+        tests.get("level3", []), f"{rfc_id}.tests.level3", non_empty=False
+    )
     batch = value.get("integration_batch")
     if not isinstance(batch, str) or not batch.strip():
         raise RegistryError(f"{rfc_id}.integration_batch must be non-empty")
@@ -254,8 +305,10 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         python_sources=sources,
         config_sources=config_sources,
         target_files=targets,
+        target_prefixes=target_prefixes,
         source_targets=source_targets,
         config_targets=config_targets,
+        shared_change_requests=shared_change_requests,
         lock_keys=lock_keys,
         depends_on=dependencies,
         provides=provides,
@@ -263,6 +316,7 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         contract_definitions=dict(definitions),
         level1_tests=level1,
         level2_tests=level2,
+        level3_tests=level3,
         integration_batch=batch.strip(),
         acceptance_criteria=acceptance,
         raw=dict(value),
@@ -307,6 +361,135 @@ def _validate_unique_ownership(rfcs: Iterable[RfcRevision], field: str) -> None:
             owners[path] = rfc.rfc_id
 
 
+def _validate_target_ownership(rfcs: Iterable[RfcRevision]) -> None:
+    values = list(rfcs)
+    _validate_unique_ownership(values, "target_files")
+    _validate_unique_ownership(values, "target_prefixes")
+    owners: list[tuple[str, bool, str]] = []
+    for rfc in values:
+        owners.extend((path, False, rfc.rfc_id) for path in rfc.target_files)
+        owners.extend((path, True, rfc.rfc_id) for path in rfc.target_prefixes)
+    for index, (path, is_prefix, owner) in enumerate(owners):
+        for other_path, other_is_prefix, other_owner in owners[index + 1 :]:
+            if owner == other_owner:
+                continue
+            overlaps = (
+                path == other_path
+                or (is_prefix and other_path.startswith(path + "/"))
+                or (other_is_prefix and path.startswith(other_path + "/"))
+            )
+            if overlaps:
+                raise RegistryError(
+                    "target ownership collision for "
+                    f"{path} and {other_path}: {owner} and {other_owner}"
+                )
+
+
+def _parse_shared_resources(value: object) -> dict[str, SharedResource]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise RegistryError("shared_resources must be a non-empty object when present")
+    resources: dict[str, SharedResource] = {}
+    owned_files: dict[str, str] = {}
+    for name, raw in value.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(raw, dict):
+            raise RegistryError("shared_resources contains an invalid entry")
+        files = tuple(
+            normalized_relative_path(item, f"shared_resources.{name}.files")
+            for item in string_list(raw.get("files"), f"shared_resources.{name}.files")
+        )
+        writer = raw.get("writer")
+        template = raw.get("request_template")
+        request_owner = raw.get("request_owner")
+        application_stage = raw.get("application_stage")
+        if not isinstance(writer, str) or not writer.strip():
+            raise RegistryError(f"shared_resources.{name}.writer must be non-empty")
+        if not isinstance(template, str) or template.count("{rfc_id}") != 1:
+            raise RegistryError(
+                f"shared_resources.{name}.request_template must contain one {{rfc_id}}"
+            )
+        if request_owner not in {"coder", "control-plane"}:
+            raise RegistryError(
+                f"shared_resources.{name}.request_owner must be coder or control-plane"
+            )
+        if application_stage not in {"before-level1", "after-level3"}:
+            raise RegistryError(
+                f"shared_resources.{name}.application_stage is invalid"
+            )
+        if request_owner == "coder" and application_stage != "before-level1":
+            raise RegistryError(f"Coder request {name} must be applied before Level 1")
+        if request_owner == "control-plane" and application_stage != "after-level3":
+            raise RegistryError(f"control-plane request {name} must be produced after Level 3")
+        normalized_relative_path(
+            template.replace("{rfc_id}", "RFC-20000101-001"),
+            f"shared_resources.{name}.request_template",
+        )
+        for path in files:
+            previous = owned_files.get(path)
+            if previous:
+                raise RegistryError(
+                    f"shared resource file {path} is declared by {previous} and {name}"
+                )
+            owned_files[path] = name
+        resources[name] = SharedResource(
+            name,
+            files,
+            writer.strip(),
+            template,
+            request_owner,
+            application_stage,
+        )
+    return resources
+
+
+def _validate_shared_resources(
+    resources: dict[str, SharedResource], rfcs: Iterable[RfcRevision]
+) -> None:
+    if not resources:
+        for rfc in rfcs:
+            if rfc.shared_change_requests:
+                raise RegistryError(
+                    f"{rfc.rfc_id} declares requests without shared_resources"
+                )
+        return
+    shared_files = {path for resource in resources.values() for path in resource.files}
+    for rfc in rfcs:
+        if set(rfc.shared_change_requests) != set(resources):
+            raise RegistryError(
+                f"{rfc.rfc_id}.shared_change_requests must exactly name all shared resources"
+            )
+        for name, resource in resources.items():
+            expected = resource.request_template.replace("{rfc_id}", rfc.rfc_id)
+            if rfc.shared_change_requests[name] != expected:
+                raise RegistryError(
+                    f"{rfc.rfc_id}.shared_change_requests.{name} must be {expected}"
+                )
+        direct = sorted(shared_files.intersection(rfc.target_files))
+        if direct:
+            raise RegistryError(
+                f"{rfc.rfc_id} directly owns broker-managed shared files: {direct}"
+            )
+        prefixed = sorted(
+            path
+            for path in shared_files
+            if any(path == prefix or path.startswith(prefix + "/") for prefix in rfc.target_prefixes)
+        )
+        if prefixed:
+            raise RegistryError(
+                f"{rfc.rfc_id} target prefix captures broker-managed shared files: {prefixed}"
+            )
+        for name, request in rfc.shared_change_requests.items():
+            resource = resources[name]
+            is_owned = request in rfc.target_files
+            if resource.request_owner == "coder" and not is_owned:
+                raise RegistryError(f"{rfc.rfc_id} must own Coder request {request}")
+            if resource.request_owner == "control-plane" and is_owned:
+                raise RegistryError(
+                    f"{rfc.rfc_id} cannot own control-plane request {request}"
+                )
+
+
 def _validate_contracts(registry: Registry) -> None:
     providers: dict[str, tuple[str, str]] = {}
     for rfc in registry.rfcs.values():
@@ -331,6 +514,48 @@ def _validate_contracts(registry: Registry) -> None:
             if digest != provided_digest:
                 raise RegistryError(
                     f"{rfc.rfc_id} requires {name} at {digest}, provider has {provided_digest}"
+                )
+
+
+def _validate_interface_artifacts(path: Path, rfcs: Iterable[RfcRevision]) -> None:
+    parent = path.resolve().parent
+    repository = parent.parent if parent.name == "coordination" else parent
+    for rfc in rfcs:
+        artifact_value = rfc.raw.get("interface_artifact")
+        artifact_digest = rfc.raw.get("interface_artifact_sha256")
+        if artifact_value is None and artifact_digest is None:
+            continue
+        artifact_path = normalized_relative_path(
+            artifact_value, f"{rfc.rfc_id}.interface_artifact"
+        )
+        if not isinstance(artifact_digest, str) or not SHA256_RE.fullmatch(artifact_digest):
+            raise RegistryError(f"{rfc.rfc_id}.interface_artifact_sha256 is invalid")
+        resolved = (repository / artifact_path).resolve()
+        try:
+            resolved.relative_to(repository)
+        except ValueError as exc:
+            raise RegistryError(f"{rfc.rfc_id}.interface_artifact escapes repository") from exc
+        try:
+            artifact = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RegistryError(
+                f"cannot load {rfc.rfc_id} interface artifact {artifact_path}: {exc}"
+            ) from exc
+        if content_digest(artifact) != artifact_digest:
+            raise RegistryError(f"{rfc.rfc_id} interface artifact digest mismatch")
+        if not isinstance(artifact, dict):
+            raise RegistryError(f"{rfc.rfc_id} interface artifact must be an object")
+        if artifact.get("owner") != rfc.rfc_id or artifact.get("revision") != rfc.revision:
+            raise RegistryError(f"{rfc.rfc_id} interface artifact identity mismatch")
+        for name, definition in rfc.contract_definitions.items():
+            if not isinstance(definition, dict):
+                raise RegistryError(f"{rfc.rfc_id} contract {name} definition is invalid")
+            if (
+                definition.get("interfaceArtifact") != artifact_path
+                or definition.get("interfaceArtifactSha256") != artifact_digest
+            ):
+                raise RegistryError(
+                    f"{rfc.rfc_id} contract {name} does not bind its interface artifact"
                 )
 
 
@@ -365,13 +590,44 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
     if not isinstance(values, list) or not values:
         raise RegistryError("rfcs must be a non-empty list")
     parsed = [_parse_rfc(value, index) for index, value in enumerate(values)]
+    shared_resources = _parse_shared_resources(document.get("shared_resources"))
+    frozen_control_paths = tuple(
+        normalized_relative_path(item, "frozen_control_paths")
+        for item in string_list(
+            document.get("frozen_control_paths", []),
+            "frozen_control_paths",
+            non_empty=False,
+        )
+    )
     rfcs = {rfc.rfc_id: rfc for rfc in parsed}
     if len(rfcs) != len(parsed):
         raise RegistryError("RFC IDs must be unique")
     order = _topological_order(rfcs)
     _validate_unique_ownership(parsed, "python_sources")
     _validate_unique_ownership(parsed, "config_sources")
-    _validate_unique_ownership(parsed, "target_files")
+    _validate_target_ownership(parsed)
+    _validate_shared_resources(shared_resources, parsed)
+    for rfc in parsed:
+        captured = sorted(
+            frozen
+            for frozen in frozen_control_paths
+            if any(
+                frozen == target
+                or target.startswith(frozen + "/")
+                or frozen.startswith(target + "/")
+                for target in rfc.target_files
+            )
+            or any(
+                frozen == prefix
+                or frozen.startswith(prefix + "/")
+                or prefix.startswith(frozen + "/")
+                for prefix in rfc.target_prefixes
+            )
+        )
+        if captured:
+            raise RegistryError(
+                f"{rfc.rfc_id} captures frozen control paths: {captured}"
+            )
     registry = Registry(
         schema_version=1,
         baseline_commit=commit,
@@ -381,6 +637,8 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
         baseline_tree=tree,
         base_delivery_rfc=None,
         base_delivery_commit=None,
+        shared_resources=shared_resources,
+        frozen_control_paths=frozen_control_paths,
         rfcs=rfcs,
         topological_order=order,
         digest=content_digest(document),
@@ -400,6 +658,7 @@ def load_registry(path: Path, classification_path: Path | None = None) -> Regist
         object.__setattr__(registry, "base_delivery_rfc", base_rfc)
         object.__setattr__(registry, "base_delivery_commit", base_commit)
     _validate_contracts(registry)
+    _validate_interface_artifacts(path, parsed)
     if classification_path is not None:
         validate_exact_partition(registry, classification_path)
     return registry

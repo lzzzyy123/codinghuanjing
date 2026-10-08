@@ -6,11 +6,11 @@ import argparse
 import json
 from pathlib import Path
 
-from .leases import QueueStore
+from .git_verifier import GitVerificationError, RepositoryGitVerifier
 from .registry import Registry, RegistryError, load_registry
 from .replay import replay_legacy_reports
 from .scheduler import DagScheduler
-from .state_store import StateStore
+from .state_store import StateConflict, StateStore
 from .status import status_snapshot
 
 
@@ -49,6 +49,26 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("reports", type=Path)
     recover = commands.add_parser("recover")
     recover.add_argument("database", type=Path)
+    for name in ("record-base-delivery", "record-merge"):
+        control = commands.add_parser(name)
+        control.add_argument("dag", type=Path)
+        control.add_argument("database", type=Path)
+        control.add_argument("classification", type=Path)
+        control.add_argument("repository", type=Path)
+        control.add_argument("--remote", default="origin")
+        control.add_argument("--branch", default="main")
+        control.add_argument("--recorded-by", required=True)
+        control.add_argument(
+            "--test-mode",
+            action="store_true",
+            help="TEST FIXTURES ONLY: allow a non-production registry partition",
+        )
+    base_delivery = commands.choices["record-base-delivery"]
+    base_delivery.add_argument("merged_base_commit")
+    merge = commands.choices["record-merge"]
+    merge.add_argument("rfc_id")
+    merge.add_argument("candidate_digest")
+    merge.add_argument("merge_commit")
     return root
 
 
@@ -74,6 +94,19 @@ def _load_validated_registry(
             f"{args.command} requires the production {PRODUCTION_CONFIG_DATA_COUNT}-path "
             f"config-data partition, registry declares {registry.config_data_count}"
         )
+    if not args.test_mode and not registry.shared_resources:
+        root.error(f"{args.command} requires broker-managed shared_resources policy")
+    if not args.test_mode and not registry.frozen_control_paths:
+        root.error(f"{args.command} requires a frozen_control_paths policy")
+    if not args.test_mode:
+        missing_level3 = sorted(
+            rfc.rfc_id for rfc in registry.rfcs.values() if not rfc.level3_tests
+        )
+        if missing_level3:
+            root.error(
+                f"{args.command} requires Level 3 gates for every RFC; "
+                f"missing={missing_level3[:10]}"
+            )
     return registry
 
 
@@ -105,8 +138,49 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "replay":
         print(json.dumps(replay_legacy_reports(args.reports).as_dict(), indent=2))
     elif args.command == "recover":
-        recovered = QueueStore(StateStore(args.database)).recover_expired()
-        print(json.dumps({"recovered_jobs": recovered}))
+        root.error(
+            "scheduler-recover is disabled: an active supervisor must first prove "
+            "the expired executor and its descendants are quiescent"
+        )
+    elif args.command in {"record-base-delivery", "record-merge"}:
+        registry = _load_validated_registry(root, args)
+        if not args.database.is_file():
+            root.error("scheduler database does not exist; run scheduler-init first")
+        store = StateStore(args.database, args.database.parent / "evidence")
+        with store.connect() as connection:
+            imported = connection.execute(
+                "SELECT 1 FROM registries WHERE digest = ?", (registry.digest,)
+            ).fetchone()
+        if imported is None:
+            root.error("scheduler database is not initialized for this registry digest")
+        try:
+            verifier = RepositoryGitVerifier(
+                args.repository,
+                trusted_main_ref="refs/coding-scheduler/trusted-main",
+            )
+            scheduler = DagScheduler(registry, store, verifier)
+            trusted_main = verifier.refresh_trusted_main(args.remote, args.branch)
+            if args.command == "record-base-delivery":
+                scheduler.record_base_delivery(args.merged_base_commit, args.recorded_by)
+            else:
+                if args.rfc_id not in registry.rfcs:
+                    raise StateConflict(f"unknown RFC: {args.rfc_id}")
+                scheduler.record_merge(
+                    args.rfc_id,
+                    args.candidate_digest,
+                    args.merge_commit,
+                    registry.rfcs[args.rfc_id].provides,
+                    args.recorded_by,
+                )
+            readiness = scheduler.refresh_ready(actor=f"operator:{args.recorded_by}")
+        except (GitVerificationError, StateConflict, ValueError) as exc:
+            root.error(f"{args.command} refused: {exc}")
+        print(
+            json.dumps(
+                {"trusted_main_commit": trusted_main, **readiness},
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":

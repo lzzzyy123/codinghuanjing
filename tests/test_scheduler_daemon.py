@@ -8,6 +8,7 @@ from pathlib import Path
 
 from scheduler.daemon import DaemonConfig, SchedulerDaemon
 from scheduler.state_store import StateStore
+from scheduler.registry import content_digest
 
 
 class DaemonTests(unittest.TestCase):
@@ -25,15 +26,30 @@ class DaemonTests(unittest.TestCase):
                 "capability_group": "test",
                 "revision": 1,
                 "python_sources": ["a.py"],
-                "target_files": ["a.ts"],
+                "target_files": [
+                    "a.ts",
+                    "coordination/requests/RFC-20261008-056/dependencies.json",
+                ],
+                "shared_change_requests": {
+                    "dependency-manifest": "coordination/requests/RFC-20261008-056/dependencies.json"
+                },
                 "source_targets": {"a.py": "a.ts"},
                 "lock_keys": ["fixture"],
                 "depends_on": [],
                 "contracts": {"provides": {}, "requires": {}, "definitions": {}},
-                "tests": {"level1": ["true"], "level2": ["true"]},
+                "tests": {"level1": ["true"], "level2": ["true"], "level3": ["true"]},
                 "integration_batch": "test",
                 "acceptance_criteria": ["Valid."],
             }
+            artifact = {
+                "schema_version": 1,
+                "owner": rfc["id"],
+                "revision": rfc["revision"],
+            }
+            artifact_path = root / "interface.json"
+            artifact_path.write_text(json.dumps(artifact))
+            rfc["interface_artifact"] = "interface.json"
+            rfc["interface_artifact_sha256"] = content_digest(artifact)
             from scheduler.registry import with_revision_digest
 
             dag = root / "dag.json"
@@ -48,6 +64,16 @@ class DaemonTests(unittest.TestCase):
                             "in_scope_count": 1,
                             "config_data_count": 0,
                         },
+                        "shared_resources": {
+                            "dependency-manifest": {
+                                "files": ["package.json", "bun.lock"],
+                                "writer": "integration-git-broker",
+                                "request_template": "coordination/requests/{rfc_id}/dependencies.json",
+                                "request_owner": "coder",
+                                "application_stage": "before-level1",
+                            }
+                        },
+                        "frozen_control_paths": ["tsconfig.json"],
                         "rfcs": [with_revision_digest(rfc)],
                     }
                 )
@@ -62,13 +88,12 @@ class DaemonTests(unittest.TestCase):
                 jobs = connection.execute(
                     "SELECT kind, state, revision_digest FROM jobs"
                 ).fetchall()
-                self.assertEqual(len(jobs), 1)
-                self.assertEqual((jobs[0]["kind"], jobs[0]["state"]), ("coding", "queued"))
+                self.assertEqual(len(jobs), 0)
 
             second = daemon.reconcile()
             self.assertEqual(second["enqueued_jobs"], result["enqueued_jobs"])
             with StateStore(database).connect() as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
 
     def test_non_shadow_mode_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "production cutover"):

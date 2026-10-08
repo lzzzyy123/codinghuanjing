@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,10 +74,29 @@ CREATE TABLE IF NOT EXISTS transitions (
     metadata_json TEXT NOT NULL,
     UNIQUE(rfc_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS transition_outbox (
+    rfc_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    materialized INTEGER NOT NULL DEFAULT 0,
+    materialized_at TEXT,
+    PRIMARY KEY(rfc_id, sequence),
+    FOREIGN KEY(rfc_id, sequence) REFERENCES transitions(rfc_id, sequence)
+);
+CREATE TRIGGER IF NOT EXISTS transitions_to_outbox
+AFTER INSERT ON transitions
+BEGIN
+    INSERT OR IGNORE INTO transition_outbox(rfc_id, sequence)
+    VALUES (NEW.rfc_id, NEW.sequence);
+END;
 CREATE TABLE IF NOT EXISTS merge_records (
     rfc_id TEXT PRIMARY KEY REFERENCES tasks(rfc_id),
     revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    candidate_digest TEXT NOT NULL,
+    candidate_commit TEXT NOT NULL,
+    review_run_id INTEGER NOT NULL REFERENCES review_runs(review_run_id),
+    level3_test_run_id INTEGER NOT NULL REFERENCES test_runs(test_run_id),
     merge_commit TEXT NOT NULL,
+    trusted_main_commit TEXT NOT NULL,
     contracts_json TEXT NOT NULL,
     recorded_by TEXT NOT NULL,
     recorded_at TEXT NOT NULL
@@ -85,6 +105,7 @@ CREATE TABLE IF NOT EXISTS base_delivery_records (
     required_rfc_id TEXT PRIMARY KEY,
     required_commit TEXT NOT NULL,
     merged_base_commit TEXT NOT NULL,
+    trusted_main_commit TEXT NOT NULL,
     ancestor_verified INTEGER NOT NULL,
     recorded_by TEXT NOT NULL,
     recorded_at TEXT NOT NULL
@@ -108,6 +129,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     role TEXT NOT NULL,
     state TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 0,
+    base_commit TEXT,
     candidate_digest TEXT,
     attempt INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL,
@@ -135,6 +157,11 @@ CREATE TABLE IF NOT EXISTS leases (
     heartbeat_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     UNIQUE(resource_type, resource_id)
+);
+CREATE TABLE IF NOT EXISTS lease_locks (
+    lock_key TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL REFERENCES leases(lease_id) ON DELETE CASCADE,
+    fencing_token INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     digest TEXT PRIMARY KEY,
@@ -172,6 +199,27 @@ CREATE TABLE IF NOT EXISTS review_runs (
     independent INTEGER NOT NULL DEFAULT 0,
     evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS candidate_records (
+    rfc_id TEXT NOT NULL REFERENCES tasks(rfc_id),
+    revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    candidate_digest TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    tree_sha TEXT NOT NULL,
+    diff_digest TEXT NOT NULL,
+    author_agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    author_process_identity TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(rfc_id, revision_digest, candidate_digest)
+);
+CREATE TABLE IF NOT EXISTS migration_blockers (
+    blocker_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
 );
 """
 
@@ -218,19 +266,157 @@ class StateStore:
             connection.execute(
                 "ALTER TABLE review_runs ADD COLUMN independent INTEGER NOT NULL DEFAULT 0"
             )
+        job_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        if "base_commit" not in job_columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN base_commit TEXT")
+        candidate_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(candidate_records)")
+        }
+        for name in ("branch", "commit_sha", "tree_sha", "diff_digest"):
+            if name not in candidate_columns:
+                connection.execute(f"ALTER TABLE candidate_records ADD COLUMN {name} TEXT")
+        merge_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(merge_records)")
+        }
+        for name in (
+            "candidate_digest",
+            "candidate_commit",
+            "review_run_id",
+            "level3_test_run_id",
+        ):
+            if name not in merge_columns:
+                column_type = "INTEGER" if name.endswith("_run_id") else "TEXT"
+                connection.execute(
+                    f"ALTER TABLE merge_records ADD COLUMN {name} {column_type}"
+                )
+        if "trusted_main_commit" not in merge_columns:
+            connection.execute(
+                "ALTER TABLE merge_records ADD COLUMN trusted_main_commit TEXT"
+            )
+        base_delivery_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(base_delivery_records)")
+        }
+        if "trusted_main_commit" not in base_delivery_columns:
+            connection.execute(
+                "ALTER TABLE base_delivery_records ADD COLUMN trusted_main_commit TEXT"
+            )
+
+        # Pre-pin scheduler databases may contain coding/integration jobs whose
+        # checkout base is unknowable. They must never become claimable after an
+        # upgrade. Preserve them as cancelled evidence while freeing the original
+        # idempotency key so the scheduler can create a correctly pinned job.
+        invalid_jobs = connection.execute(
+            "SELECT job_id, rfc_id, state FROM jobs WHERE kind IN ('coding', 'integration') "
+            "AND base_commit IS NULL AND state IN ('queued', 'leased', 'running')"
+        ).fetchall()
+        for job in invalid_jobs:
+            if job["state"] == "queued":
+                connection.execute(
+                    "UPDATE jobs SET state = 'cancelled', "
+                    "idempotency_key = idempotency_key || ':invalid-unpinned:' || job_id, "
+                    "result_json = ?, updated_at = ? WHERE job_id = ?",
+                    (
+                        json.dumps(
+                            {"failure_kind": "BASE_COMMIT_MIGRATION_REQUIRED"},
+                            sort_keys=True,
+                        ),
+                        utc_now(),
+                        job["job_id"],
+                    ),
+                )
+            else:
+                # Never release an active legacy lease here: the old executor may
+                # still be writing. Cutover remains blocked until an external
+                # supervisor confirms termination and resolves this record.
+                connection.execute(
+                    "INSERT OR IGNORE INTO migration_blockers VALUES (?, ?, ?, ?, NULL)",
+                    (
+                        f"unpinned-active-job:{job['job_id']}",
+                        "UNPINNED_ACTIVE_JOB",
+                        json.dumps(
+                            {
+                                "job_id": int(job["job_id"]),
+                                "rfc_id": str(job["rfc_id"]),
+                                "state": str(job["state"]),
+                            },
+                            sort_keys=True,
+                        ),
+                        utc_now(),
+                    ),
+                )
+                task = connection.execute(
+                    "SELECT state, event_sequence, revision_digest FROM tasks WHERE rfc_id = ?",
+                    (job["rfc_id"],),
+                ).fetchone()
+                if task is not None and task["state"] not in {
+                    TaskState.BLOCKED.value,
+                    TaskState.DONE.value,
+                }:
+                    sequence = int(task["event_sequence"]) + 1
+                    occurred_at = utc_now()
+                    connection.execute(
+                        "UPDATE tasks SET state = ?, reason = ?, event_sequence = ?, "
+                        "updated_at = ? WHERE rfc_id = ?",
+                        (
+                            TaskState.BLOCKED.value,
+                            "legacy active job had no pinned base commit",
+                            sequence,
+                            occurred_at,
+                            job["rfc_id"],
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO transitions "
+                        "(rfc_id, sequence, from_state, to_state, reason, actor, "
+                        "revision_digest, occurred_at, metadata_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            job["rfc_id"],
+                            sequence,
+                            task["state"],
+                            TaskState.BLOCKED.value,
+                            "legacy active job had no pinned base commit",
+                            "schema-migration",
+                            task["revision_digest"],
+                            occurred_at,
+                            json.dumps(
+                                {
+                                    "failure_kind": "BASE_COMMIT_MIGRATION_REQUIRED",
+                                    "job_id": int(job["job_id"]),
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+        connection.execute(
+            "INSERT OR IGNORE INTO transition_outbox(rfc_id, sequence) "
+            "SELECT rfc_id, sequence FROM transitions"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
+        committed = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
+            committed = True
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+        if committed:
+            try:
+                self.materialize_transition_evidence()
+            except OSError:
+                # The committed outbox row is the durable source of truth. The
+                # daemon retries projection after transient filesystem errors.
+                pass
 
     def import_registry(self, registry: Registry) -> None:
         now = utc_now()
@@ -251,6 +437,21 @@ class StateStore:
             for rfc_id in registry.topological_order:
                 rfc = registry.rfcs[rfc_id]
                 payload = json.dumps(rfc.raw, ensure_ascii=False, sort_keys=True)
+                supersedes = rfc.raw.get("supersedes")
+                if rfc.revision > 1:
+                    predecessor = connection.execute(
+                        "SELECT revision_digest FROM rfc_revisions "
+                        "WHERE rfc_id = ? AND revision = ?",
+                        (rfc_id, rfc.revision - 1),
+                    ).fetchone()
+                    if predecessor is not None and (
+                        not isinstance(supersedes, dict)
+                        or predecessor["revision_digest"]
+                        != supersedes.get("revision_digest")
+                    ):
+                        raise StateConflict(
+                            f"revision lineage conflict for {rfc_id} revision {rfc.revision}"
+                        )
                 existing = connection.execute(
                     "SELECT revision_digest, payload_json FROM rfc_revisions "
                     "WHERE rfc_id = ? AND revision = ?",
@@ -389,7 +590,7 @@ class StateStore:
                     json.dumps(details, ensure_ascii=False, sort_keys=True),
                 ),
             )
-        event = {
+        return {
             "rfc_id": rfc_id,
             "sequence": sequence,
             "from_state": expected.value,
@@ -400,8 +601,6 @@ class StateStore:
             "occurred_at": occurred_at,
             "metadata": details,
         }
-        self._append_evidence(rfc_id, event)
-        return event
 
     def transitions(self, rfc_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -415,16 +614,102 @@ class StateStore:
             result.append(value)
         return result
 
-    def _append_evidence(self, rfc_id: str, event: dict[str, Any]) -> None:
+    def materialize_transition_evidence(self) -> int:
         if self.evidence_root is None:
-            return
-        directory = self.evidence_root / rfc_id
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "scheduler-events.jsonl"
-        line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+            return 0
+        connection = self.connect()
         try:
-            os.write(descriptor, line.encode("utf-8"))
-            os.fsync(descriptor)
+            # Serialize database transitions with their filesystem projection. This
+            # prevents two materializers from acknowledging projections built from
+            # different transition snapshots.
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT transitions.*, transition_outbox.materialized "
+                "FROM transitions JOIN transition_outbox USING(rfc_id, sequence) "
+                "ORDER BY transitions.rfc_id, transitions.sequence"
+            ).fetchall()
+            grouped: dict[str, list[tuple[int, bytes, bool]]] = {}
+            for row in rows:
+                event = {
+                    "rfc_id": row["rfc_id"],
+                    "sequence": int(row["sequence"]),
+                    "from_state": row["from_state"],
+                    "to_state": row["to_state"],
+                    "reason": row["reason"],
+                    "actor": row["actor"],
+                    "revision_digest": row["revision_digest"],
+                    "occurred_at": row["occurred_at"],
+                    "metadata": json.loads(row["metadata_json"]),
+                }
+                content = (
+                    json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                grouped.setdefault(str(row["rfc_id"]), []).append(
+                    (int(row["sequence"]), content, bool(row["materialized"]))
+                )
+
+            materialized = 0
+            for rfc_id, events in grouped.items():
+                directory = self.evidence_root / rfc_id
+                event_directory = directory / "scheduler-events"
+                event_directory.mkdir(parents=True, exist_ok=True)
+                for sequence, content, _ in events:
+                    path = event_directory / f"{sequence:08d}.json"
+                    if path.exists():
+                        if path.read_bytes() != content:
+                            raise StateConflict(
+                                f"immutable transition evidence differs: {path}"
+                            )
+                    else:
+                        self._atomic_write(path, content)
+
+                # The outbox is acknowledged only after both immutable events and
+                # the complete JSONL projection have reached their final paths.
+                projection = directory / "scheduler-events.jsonl"
+                projection_content = b"".join(content for _, content, _ in events)
+                if not projection.exists() or projection.read_bytes() != projection_content:
+                    self._atomic_write(projection, projection_content)
+                pending_sequences = [
+                    sequence for sequence, _, already_materialized in events
+                    if not already_materialized
+                ]
+                if pending_sequences:
+                    placeholders = ",".join("?" for _ in pending_sequences)
+                    connection.execute(
+                        "UPDATE transition_outbox SET materialized = 1, materialized_at = ? "
+                        f"WHERE rfc_id = ? AND sequence IN ({placeholders}) "
+                        "AND materialized = 0",
+                        (utc_now(), rfc_id, *pending_sequences),
+                    )
+                    materialized += len(pending_sequences)
+            connection.commit()
+            return materialized
+        except Exception:
+            connection.rollback()
+            raise
         finally:
-            os.close(descriptor)
+            connection.close()
+
+    @staticmethod
+    def _atomic_write(path: Path, content: bytes) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o640)
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            descriptor = -1
+            os.replace(temporary, path)
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)

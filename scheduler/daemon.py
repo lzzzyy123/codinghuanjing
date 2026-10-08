@@ -15,7 +15,6 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .leases import QueueStore
 from .registry import load_registry
 from .scheduler import DagScheduler
 from .state_store import StateStore
@@ -51,18 +50,35 @@ class SchedulerDaemon:
 
     def reconcile(self) -> dict[str, object]:
         registry = load_registry(self.config.dag, self.config.classification)
+        if not registry.shared_resources:
+            raise ValueError("production DAG requires broker-managed shared_resources policy")
+        if not registry.frozen_control_paths:
+            raise ValueError("production DAG requires frozen_control_paths policy")
+        if any(not rfc.level3_tests for rfc in registry.rfcs.values()):
+            raise ValueError("production DAG requires Level 3 gates for every RFC")
+        if any(
+            not rfc.raw.get("interface_artifact")
+            or not rfc.raw.get("interface_artifact_sha256")
+            for rfc in registry.rfcs.values()
+        ):
+            raise ValueError("production DAG requires versioned interface artifacts")
         store = StateStore(self.config.database, self.config.evidence_root)
         store.import_registry(registry)
         scheduler = DagScheduler(registry, store)
         validated = scheduler.validate_tasks()
-        recovered = QueueStore(store).recover_expired()
         readiness = scheduler.refresh_ready()
-        enqueued = scheduler.enqueue_ready()
+        repaired_evidence = store.materialize_transition_evidence()
+        # Shadow mode validates persistence/readiness without creating runnable
+        # jobs against an unverified repository base.
+        enqueued: list[int] = []
         return {
             "registry": registry.digest,
             "validated": validated,
-            "recovered_jobs": recovered,
+            # Shadow mode has no process supervisor and therefore cannot prove
+            # that an expired executor is quiescent. It never releases leases.
+            "recovered_jobs": [],
             "enqueued_jobs": enqueued,
+            "repaired_evidence": repaired_evidence,
             **readiness,
         }
 

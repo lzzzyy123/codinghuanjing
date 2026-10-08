@@ -14,6 +14,16 @@ from scheduler.registry import with_revision_digest
 from scheduler.state_store import StateStore
 
 
+def git(cwd: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.strip()
+
+
 def write_fixture(
     root: Path, *, count: int = 1, config_count: int = 0
 ) -> tuple[Path, Path]:
@@ -41,7 +51,14 @@ def write_fixture(
             "revision": 1,
             "python_sources": [entry["path"] for entry in entries if entry["disposition"] == "in_scope"],
             "config_sources": [entry["path"] for entry in config_entries],
-            "target_files": ["src/fixture.ts", "config/fixture.json"],
+            "target_files": [
+                "src/fixture.ts",
+                "config/fixture.json",
+                "coordination/requests/RFC-20261008-056/dependencies.json",
+            ],
+            "shared_change_requests": {
+                "dependency-manifest": "coordination/requests/RFC-20261008-056/dependencies.json"
+            },
             "source_targets": {
                 entry["path"]: "src/fixture.ts"
                 for entry in entries
@@ -53,7 +70,7 @@ def write_fixture(
             "lock_keys": ["fixture"],
             "depends_on": [],
             "contracts": {"provides": {}, "requires": {}, "definitions": {}},
-            "tests": {"level1": ["true"], "level2": ["true"]},
+            "tests": {"level1": ["true"], "level2": ["true"], "level3": ["true"]},
             "integration_batch": "test",
             "acceptance_criteria": ["Valid fixture."],
         }
@@ -70,6 +87,16 @@ def write_fixture(
                     "in_scope_count": count,
                     "config_data_count": config_count,
                 },
+                "shared_resources": {
+                    "dependency-manifest": {
+                        "files": ["package.json", "bun.lock"],
+                        "writer": "integration-git-broker",
+                        "request_template": "coordination/requests/{rfc_id}/dependencies.json",
+                        "request_owner": "coder",
+                        "application_stage": "before-level1",
+                    }
+                },
+                "frozen_control_paths": ["tsconfig.json"],
                 "rfcs": [rfc],
             }
         ),
@@ -177,6 +204,101 @@ class SchedulerCliTests(unittest.TestCase):
             with StateStore(database).connect() as connection:
                 count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
             self.assertEqual(count, 1)
+
+    def test_record_base_delivery_fetches_and_persists_trusted_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "remote.git"
+            repository = root / "repo"
+            git(root, "init", "--bare", str(remote))
+            repository.mkdir()
+            git(repository, "init", "-b", "main")
+            git(repository, "remote", "add", "origin", str(remote))
+            (repository / "base").write_text("base")
+            git(repository, "add", "base")
+            git(
+                repository,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@invalid",
+                "commit",
+                "-m",
+                "base",
+            )
+            base_commit = git(repository, "rev-parse", "HEAD")
+            (repository / "merged").write_text("merged")
+            git(repository, "add", "merged")
+            git(
+                repository,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@invalid",
+                "commit",
+                "-m",
+                "merged",
+            )
+            merged_commit = git(repository, "rev-parse", "HEAD")
+            git(repository, "push", "origin", "main")
+
+            dag, classification = write_fixture(root)
+            document = json.loads(dag.read_text())
+            document["base_delivery"] = {
+                "rfc": "RFC-20261008-055",
+                "commit": base_commit,
+                "required_merge_state": "merged",
+            }
+            dag.write_text(json.dumps(document))
+            database = root / "state.sqlite3"
+            code, stdout, stderr = self.invoke(
+                ["init", str(dag), str(database), str(classification), "--test-mode"]
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(json.loads(stdout)["ready"], [])
+            code, stdout, stderr = self.invoke(
+                [
+                    "record-base-delivery",
+                    str(dag),
+                    str(database),
+                    str(classification),
+                    str(repository),
+                    merged_commit,
+                    "--recorded-by",
+                    "project-lead",
+                    "--test-mode",
+                ]
+            )
+            self.assertEqual(code, 0, stderr)
+            result = json.loads(stdout)
+            self.assertEqual(result["trusted_main_commit"], merged_commit)
+            self.assertEqual(result["ready"], ["RFC-20261008-056"])
+            with StateStore(database).connect() as connection:
+                record = connection.execute(
+                    "SELECT * FROM base_delivery_records"
+                ).fetchone()
+            self.assertEqual(record["trusted_main_commit"], merged_commit)
+
+    def test_status_includes_evidence_counts_and_elapsed_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dag, classification = write_fixture(root)
+            database = root / "state.sqlite3"
+            code, _stdout, stderr = self.invoke(
+                ["init", str(dag), str(database), str(classification), "--test-mode"]
+            )
+            self.assertEqual(code, 0, stderr)
+            code, stdout, stderr = self.invoke(
+                ["status", str(dag), str(database), "--json"]
+            )
+            self.assertEqual(code, 0, stderr)
+            snapshot = json.loads(stdout)
+            self.assertEqual(
+                snapshot["evidence_counts"],
+                {"candidates": 0, "test_runs": 0, "review_runs": 0, "merges": 0},
+            )
+            self.assertIn("elapsed_seconds", snapshot["tasks"][0])
+            self.assertIn("evidence", snapshot["tasks"][0])
 
     def test_workerctl_refuses_validate_without_classification(self) -> None:
         result = subprocess.run(

@@ -5,7 +5,7 @@ BASE=/openbayes/home/coding-worker
 CONFIG="$BASE/config/worker.env"
 
 usage() {
-    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|wait-rfc|retry-review|record-pr|enqueue-amendment|scheduler-validate|scheduler-init|scheduler-status|scheduler-history|scheduler-replay|scheduler-recover|scheduler-canary}"
+    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|wait-rfc|retry-review|record-pr|enqueue-amendment|scheduler-validate|scheduler-init|scheduler-status|scheduler-history|scheduler-replay|scheduler-record-base-delivery|scheduler-record-merge|scheduler-canary}"
     echo "  coding-workerctl scheduler-validate DAG CLASSIFICATION"
     echo "  coding-workerctl scheduler-init DAG DATABASE CLASSIFICATION"
 }
@@ -128,10 +128,17 @@ case "${1:-}" in
         cd "$BASE"
         "$BASE/.venv/bin/python" -m scheduler.cli replay "$2"
         ;;
-    scheduler-recover)
-        [ "$#" -eq 2 ] || { usage; exit 2; }
+    scheduler-record-base-delivery)
+        [ "$#" -eq 7 ] || { usage; exit 2; }
         cd "$BASE"
-        "$BASE/.venv/bin/python" -m scheduler.cli recover "$2"
+        "$BASE/.venv/bin/python" -m scheduler.cli record-base-delivery \
+            "$2" "$3" "$4" "$5" "$6" --recorded-by "$7"
+        ;;
+    scheduler-record-merge)
+        [ "$#" -eq 9 ] || { usage; exit 2; }
+        cd "$BASE"
+        "$BASE/.venv/bin/python" -m scheduler.cli record-merge \
+            "$2" "$3" "$4" "$5" "$6" "$7" "$8" --recorded-by "$9"
         ;;
     scheduler-canary)
         [ "$#" -eq 1 ] || { usage; exit 2; }

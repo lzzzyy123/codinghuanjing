@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scheduler.models import TaskState
 from scheduler.leases import QueueStore
@@ -13,8 +14,7 @@ from scheduler.state_store import StateConflict, StateStore
 
 
 def registry_file(root: Path, revision: int = 1, title: str = "Task") -> Path:
-    rfc = with_revision_digest(
-        {
+    value = {
             "id": "RFC-20261008-056",
             "title": title,
             "capability_group": "agent",
@@ -29,7 +29,13 @@ def registry_file(root: Path, revision: int = 1, title: str = "Task") -> Path:
             "integration_batch": "core",
             "acceptance_criteria": ["Equivalent."],
         }
-    )
+    if revision > 1:
+        predecessor = with_revision_digest({**value, "revision": revision - 1, "title": "Task"})
+        value["supersedes"] = {
+            "revision": revision - 1,
+            "revision_digest": predecessor["revision_digest"],
+        }
+    rfc = with_revision_digest(value)
     document = {
         "schema_version": 1,
         "baseline": {
@@ -118,7 +124,7 @@ class StateStoreTests(unittest.TestCase):
             original = load_registry(registry_file(root))
             store.import_registry(original)
             queue = QueueStore(store)
-            queue.enqueue("RFC-20261008-056", "coding", "old-revision", available_at=0)
+            queue.enqueue("RFC-20261008-056", "coding", "old-revision", base_commit="a" * 40, available_at=0)
 
             revised = load_registry(registry_file(root, 2, "Revised"))
             store.import_registry(revised)
@@ -129,6 +135,177 @@ class StateStoreTests(unittest.TestCase):
             job = queue.jobs()[0]
             self.assertEqual(job["state"], "cancelled")
             self.assertEqual(job["result"]["failure_kind"], "REVISION_SUPERSEDED")
+
+    def test_migration_cancels_queued_unpinned_job_and_frees_idempotency_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "scheduler.sqlite3"
+            store = StateStore(database)
+            store.import_registry(load_registry(registry_file(root)))
+            with store.connect() as connection:
+                connection.execute(
+                    "INSERT INTO jobs "
+                    "(idempotency_key, rfc_id, revision_digest, kind, role, state, "
+                    "priority, base_commit, candidate_digest, max_attempts, available_at, "
+                    "created_at, updated_at) SELECT 'legacy-coding', rfc_id, "
+                    "revision_digest, 'coding', 'coder', 'queued', 0, NULL, NULL, 3, 0, "
+                    "'fixture', 'fixture' FROM tasks"
+                )
+
+            migrated = StateStore(database)
+            jobs = QueueStore(migrated).jobs()
+            self.assertEqual(jobs[0]["state"], "cancelled")
+            self.assertEqual(
+                jobs[0]["result"]["failure_kind"], "BASE_COMMIT_MIGRATION_REQUIRED"
+            )
+            replacement = QueueStore(migrated).enqueue(
+                "RFC-20261008-056",
+                "coding",
+                "legacy-coding",
+                base_commit="a" * 40,
+            )
+            self.assertNotEqual(replacement, jobs[0]["job_id"])
+
+    def test_migration_retains_active_unpinned_lease_and_blocks_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "scheduler.sqlite3"
+            store = StateStore(database)
+            store.import_registry(load_registry(registry_file(root)))
+            store.transition(
+                "RFC-20261008-056", TaskState.DRAFT, TaskState.VALIDATED, "fixture"
+            )
+            store.transition(
+                "RFC-20261008-056", TaskState.VALIDATED, TaskState.READY, "fixture"
+            )
+            QueueStore(store).register_agent(
+                "legacy-coder", "coder", "xiaosuan-8", "pid:legacy", now=0
+            )
+            with store.connect() as connection:
+                revision = connection.execute(
+                    "SELECT revision_digest FROM tasks WHERE rfc_id = 'RFC-20261008-056'"
+                ).fetchone()[0]
+                cursor = connection.execute(
+                    "INSERT INTO jobs "
+                    "(idempotency_key, rfc_id, revision_digest, kind, role, state, "
+                    "priority, base_commit, candidate_digest, max_attempts, available_at, "
+                    "created_at, updated_at) VALUES ('legacy-active', ?, ?, 'coding', "
+                    "'coder', 'running', 0, NULL, NULL, 3, 0, 'fixture', 'fixture')",
+                    ("RFC-20261008-056", revision),
+                )
+                job_id = int(cursor.lastrowid)
+                connection.execute(
+                    "INSERT INTO leases VALUES "
+                    "('legacy-lease', 'rfc', ?, ?, 'legacy-coder', 1, 0, 0, 999999)",
+                    ("RFC-20261008-056", job_id),
+                )
+                connection.execute(
+                    "INSERT INTO lease_locks VALUES ('fixture', 'legacy-lease', 1)"
+                )
+                connection.execute(
+                    "UPDATE tasks SET state = ? WHERE rfc_id = 'RFC-20261008-056'",
+                    (TaskState.CODING.value,),
+                )
+
+            migrated = StateStore(database)
+            with migrated.connect() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM lease_locks").fetchone()[0], 1)
+                blocker = connection.execute(
+                    "SELECT kind, resolved_at FROM migration_blockers"
+                ).fetchone()
+                self.assertEqual(blocker["kind"], "UNPINNED_ACTIVE_JOB")
+                self.assertIsNone(blocker["resolved_at"])
+            self.assertEqual(migrated.task("RFC-20261008-056")["state"], "Blocked")
+
+    def test_event_replace_failure_leaves_pending_outbox_and_retry_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "scheduler.sqlite3", root / "evidence")
+            store.import_registry(load_registry(registry_file(root)))
+            real_replace = __import__("os").replace
+            failed = False
+
+            def fail_first_replace(source: object, target: object) -> None:
+                nonlocal failed
+                if not failed and str(target).endswith("00000001.json"):
+                    failed = True
+                    raise OSError("injected event replace failure")
+                real_replace(source, target)
+
+            with mock.patch("scheduler.state_store.os.replace", side_effect=fail_first_replace):
+                store.transition(
+                    "RFC-20261008-056",
+                    TaskState.DRAFT,
+                    TaskState.VALIDATED,
+                    "validator",
+                )
+
+            with store.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM transition_outbox WHERE materialized = 0"
+                    ).fetchone()[0],
+                    1,
+                )
+            self.assertEqual(store.materialize_transition_evidence(), 1)
+            projection = root / "evidence/RFC-20261008-056/scheduler-events.jsonl"
+            self.assertTrue(projection.exists())
+            self.assertEqual(list(projection.parent.rglob("*.tmp")), [])
+
+    def test_projection_replace_failure_is_not_acknowledged_and_retry_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "scheduler.sqlite3", root / "evidence")
+            store.import_registry(load_registry(registry_file(root)))
+            real_replace = __import__("os").replace
+            failed = False
+
+            def fail_projection_replace(source: object, target: object) -> None:
+                nonlocal failed
+                if not failed and str(target).endswith("scheduler-events.jsonl"):
+                    failed = True
+                    raise OSError("injected projection replace failure")
+                real_replace(source, target)
+
+            with mock.patch(
+                "scheduler.state_store.os.replace", side_effect=fail_projection_replace
+            ):
+                store.transition(
+                    "RFC-20261008-056",
+                    TaskState.DRAFT,
+                    TaskState.VALIDATED,
+                    "validator",
+                )
+
+            projection = root / "evidence/RFC-20261008-056/scheduler-events.jsonl"
+            self.assertFalse(projection.exists())
+            with store.connect() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM transition_outbox WHERE materialized = 0"
+                    ).fetchone()[0],
+                    1,
+                )
+            self.assertEqual(store.materialize_transition_evidence(), 1)
+            self.assertTrue(projection.exists())
+
+    def test_materializer_repairs_missing_projection_without_pending_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "scheduler.sqlite3", root / "evidence")
+            store.import_registry(load_registry(registry_file(root)))
+            store.transition(
+                "RFC-20261008-056",
+                TaskState.DRAFT,
+                TaskState.VALIDATED,
+                "validator",
+            )
+            projection = root / "evidence/RFC-20261008-056/scheduler-events.jsonl"
+            projection.unlink()
+
+            self.assertEqual(store.materialize_transition_evidence(), 0)
+            self.assertTrue(projection.exists())
 
 
 if __name__ == "__main__":

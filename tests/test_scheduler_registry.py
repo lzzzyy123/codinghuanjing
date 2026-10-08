@@ -62,6 +62,14 @@ def load(value: dict):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_rejects_target_nested_below_frozen_control_directory(self) -> None:
+        value = document(
+            [rfc("RFC-20261008-056", "a.py", "coordination/contracts/a.json")]
+        )
+        value["frozen_control_paths"] = ["coordination/contracts"]
+        with self.assertRaisesRegex(RegistryError, "captures frozen control paths"):
+            load(value)
+
     def test_loads_content_addressed_dag_and_contract(self) -> None:
         first = rfc(
             "RFC-20261008-056",
