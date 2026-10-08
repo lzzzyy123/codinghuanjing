@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -38,6 +39,67 @@ class RepositoryGitVerifier:
 
     def resolve_trusted_main(self) -> str:
         return self._resolve(self.trusted_main_ref)
+
+    def resolve_ref(self, ref_name: str) -> str:
+        """Resolve one fully-qualified local ref without changing repository state."""
+        if (
+            not ref_name.startswith("refs/")
+            or not REF_RE.fullmatch(ref_name)
+            or ".." in ref_name
+        ):
+            raise ValueError("invalid fully-qualified Git ref")
+        return self._resolve(ref_name)
+
+    def require_exact_ref(self, ref_name: str, expected_commit: str) -> None:
+        self.require_commit(expected_commit)
+        if self.resolve_ref(ref_name) != expected_commit:
+            raise GitVerificationError(
+                f"{ref_name} does not identify the reviewed candidate {expected_commit}"
+            )
+
+    def candidate_tree(self, commit: str) -> str:
+        self.require_commit(commit)
+        return self._resolve(f"{commit}^{{tree}}")
+
+    def candidate_diff_digest(self, base_commit: str, commit: str) -> str:
+        self.require_ancestor(base_commit, commit)
+        result = self._git_bytes(
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            base_commit,
+            commit,
+            "--",
+        )
+        return "sha256:" + hashlib.sha256(result.stdout).hexdigest()
+
+    def changed_paths(self, base_commit: str, commit: str) -> tuple[str, ...]:
+        self.require_ancestor(base_commit, commit)
+        result = self._git_bytes(
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_commit,
+            commit,
+            "--",
+        )
+        try:
+            paths = tuple(
+                sorted(part.decode("utf-8") for part in result.stdout.split(b"\0") if part)
+            )
+        except UnicodeDecodeError as exc:
+            raise GitVerificationError("candidate contains a non-UTF-8 path") from exc
+        if any(
+            path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in Path(path).parts)
+            for path in paths
+        ):
+            raise GitVerificationError("candidate contains an invalid repository path")
+        return paths
 
     def refresh_trusted_main(self, remote: str = "origin", branch: str = "main") -> str:
         """Fetch a remote branch into the dedicated trusted ref and return its SHA."""
@@ -108,5 +170,31 @@ class RepositoryGitVerifier:
             raise GitVerificationError(
                 f"git {' '.join(arguments)} failed ({result.returncode}): "
                 f"{str(result.stderr)[-2000:]}"
+            )
+        return result
+
+    def _git_bytes(self, *arguments: str):
+        try:
+            result = run_bounded(
+                ["git", "-C", str(self.repository), *arguments],
+                cwd=self.repository,
+                text=False,
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                    "HOME": os.environ.get("HOME", "/nonexistent"),
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                },
+                timeout_seconds=self.timeout_seconds,
+            )
+        except (RunnerError, RunnerTimeout) as exc:
+            raise GitVerificationError(f"Git verification could not run: {exc}") from exc
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace")
+            raise GitVerificationError(
+                f"git {' '.join(arguments)} failed ({result.returncode}): {detail[-2000:]}"
             )
         return result

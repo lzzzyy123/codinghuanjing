@@ -237,6 +237,34 @@ CREATE INDEX IF NOT EXISTS publication_records_state_idx
 CREATE UNIQUE INDEX IF NOT EXISTS publication_records_active_ref_idx
     ON publication_records(remote, ref_name)
     WHERE state IN ('prepared', 'published', 'blocked');
+CREATE TABLE IF NOT EXISTS merge_authorization_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_digest TEXT NOT NULL UNIQUE,
+    rfc_id TEXT NOT NULL,
+    revision_digest TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    candidate_commit TEXT,
+    head_ref TEXT,
+    disposition TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    risk_json TEXT NOT NULL,
+    blockers_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS merge_authorization_rfc_idx
+    ON merge_authorization_decisions(rfc_id, decision_id);
+CREATE TRIGGER IF NOT EXISTS merge_authorization_decisions_no_update
+BEFORE UPDATE ON merge_authorization_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'merge authorization audit records are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS merge_authorization_decisions_no_delete
+BEFORE DELETE ON merge_authorization_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'merge authorization audit records are immutable');
+END;
 CREATE TABLE IF NOT EXISTS migration_blockers (
     blocker_key TEXT PRIMARY KEY,
     kind TEXT NOT NULL,

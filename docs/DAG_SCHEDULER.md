@@ -43,6 +43,13 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
 - Git commits and pushes pass through the single-writer broker. Reviewer input is a detached read-only snapshot.
 - Remote publication uses a durable pre-push journal and read-only ref reconciler; active-runner startup wiring, trusted-main fetch freshness, supervised test receipts, kernel process containment and verified UID/GID separation remain mandatory cutover blockers. Shadow mode does not claim them.
 - `Done` means Level 3 passed for the reviewed candidate. It does not mean merged. No component automatically merges main.
+- Merge authorization is an append-only, audit-only decision. It recomputes the
+  exact local RFC ref, commit tree, binary diff, ownership and candidate-bound
+  Coder/test/Reviewer/Project Lead/publication evidence. Ordinary modules may be
+  classified `AUTO_MERGE_ELIGIBLE`; protected control, security, credential,
+  permission, shared-resource and gate changes are classified
+  `NEEDS_HUMAN_APPROVAL`. Missing or stale evidence is `BLOCKED`. No merge
+  executor, production wiring, remote fetch, push, or GitHub API call is enabled.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 
 ## Three Test Levels
