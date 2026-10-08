@@ -52,35 +52,72 @@ def run_bounded(
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
-        _terminate_process_group(process)
-        stdout, stderr = process.communicate()
+        terminated = terminate_process_group(process)
+        # A descendant can create a new session and keep the inherited pipe
+        # descriptors open after the original process group is gone. Never use
+        # an unbounded communicate() here: closing our pipe endpoints makes the
+        # timeout itself the final bound even for such an escaped descendant.
+        _close_process_pipes(process)
+        if not terminated:
+            raise RunnerTimeout(
+                f"command {arguments[0]!r} timed out after {timeout_seconds:g}s "
+                "and did not terminate within the bounded shutdown grace"
+            ) from exc
         raise RunnerTimeout(
             f"command {arguments[0]!r} timed out after {timeout_seconds:g}s"
         ) from exc
     return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
-def _terminate_process_group(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
+def terminate_process_group(
+    process: subprocess.Popen, *, grace_seconds: float = 2.0
+) -> bool:
+    """Best-effort process-group shutdown with a strict total wait bound."""
+    if grace_seconds <= 0:
+        raise ValueError("grace_seconds must be positive")
+
+    # Signal the original group even when the leader has already exited. Its
+    # descendants may still be alive and holding resources or inherited FDs.
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        pass
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
     try:
-        process.wait(timeout=2)
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         pass
-    # The group leader may exit on SIGTERM while a child ignores it. Always
-    # address the process group again so a timed-out command cannot orphan work.
+
+    # The group leader may exit on SIGTERM while a child ignores it, so always
+    # address the original group again. Also kill the leader directly in case
+    # it changed its own process group after launch.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
     try:
-        process.wait(timeout=2)
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        pass
+        return False
+    return process.poll() is not None
+
+
+def _close_process_pipes(process: subprocess.Popen) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True)
@@ -108,6 +145,7 @@ import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
+forbidden_roots = [pathlib.Path(value) for value in sys.argv[2:]]
 failures = []
 for current, directories, files in os.walk(root, followlinks=False):
     current_path = pathlib.Path(current)
@@ -133,6 +171,21 @@ for current, directories, files in os.walk(root, followlinks=False):
         else:
             os.close(descriptor)
             failures.append(f"writable file: {path}")
+for forbidden in forbidden_roots:
+    probe = forbidden / f".coding-reviewer-write-probe-{os.getpid()}"
+    try:
+        descriptor = os.open(
+            probe,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            failures.append(f"unexpected forbidden-root probe error for {forbidden}: {exc}")
+    else:
+        os.close(descriptor)
+        probe.unlink(missing_ok=True)
+        failures.append(f"writable forbidden root: {forbidden}")
 if failures:
     sys.stderr.write("\n".join(failures[:20]))
     raise SystemExit(2)
@@ -171,12 +224,21 @@ class ReviewerReadOnlyProbe:
             timeout_seconds=timeout_seconds,
         )
 
-    def verify(self, root: Path) -> None:
+    def verify(
+        self, root: Path, forbidden_write_roots: Sequence[Path] = ()
+    ) -> None:
         root = root.resolve()
         if not root.is_dir():
             raise RunnerError(f"Reviewer snapshot is missing: {root}")
         result = run_bounded(
-            [*self.command_prefix, self.python_executable, "-c", _READ_ONLY_PROBE, str(root)],
+            [
+                *self.command_prefix,
+                self.python_executable,
+                "-c",
+                _READ_ONLY_PROBE,
+                str(root),
+                *(str(path.resolve()) for path in forbidden_write_roots),
+            ],
             cwd=root,
             env={
                 "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),

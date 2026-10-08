@@ -43,6 +43,29 @@ class Candidate:
     candidate_digest: str
 
 
+@dataclass(frozen=True)
+class CandidateScope:
+    """Exclusive paths a Coder candidate may change for one RFC revision."""
+
+    exact_paths: frozenset[str]
+    path_prefixes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for path in (*self.exact_paths, *self.path_prefixes):
+            if (
+                not path
+                or path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in Path(path).parts)
+            ):
+                raise ValueError(f"invalid candidate scope path: {path!r}")
+
+    def contains(self, path: str) -> bool:
+        return path in self.exact_paths or any(
+            path.startswith(prefix + "/") for prefix in self.path_prefixes
+        )
+
+
 class GitBroker:
     def __init__(
         self,
@@ -51,6 +74,7 @@ class GitBroker:
         lock_path: Path,
         validate_lease: Callable[[JobLease], None],
         *,
+        candidate_scope: Callable[[JobLease], CandidateScope] | None = None,
         command_prefix: Sequence[str] = (),
         git_timeout_seconds: float = 120,
         reviewer_read_only_probe: ReviewerReadOnlyProbe | None = None,
@@ -59,6 +83,7 @@ class GitBroker:
         self.layout = layout
         self.lock_path = lock_path
         self.validate_lease = validate_lease
+        self.candidate_scope = candidate_scope
         self.command_prefix = tuple(command_prefix)
         if git_timeout_seconds <= 0:
             raise ValueError("git_timeout_seconds must be positive")
@@ -128,6 +153,10 @@ class GitBroker:
         )
 
     def prepare_worktree(self, lease: JobLease, base_commit: str) -> Path:
+        if lease.base_commit is None:
+            raise GitBrokerError("coding lease has no pinned base commit")
+        if lease.base_commit != base_commit:
+            raise GitBrokerError("requested base commit does not match the pinned job base")
         self._validate_identity(lease.rfc_id, base_commit)
         self._validate_revision(lease.revision_digest)
         self.validate_lease(lease)
@@ -157,6 +186,10 @@ class GitBroker:
     def freeze_candidate(
         self, lease: JobLease, base_commit: str, title: str
     ) -> Candidate:
+        if lease.base_commit is None:
+            raise GitBrokerError("coding lease has no pinned base commit")
+        if lease.base_commit != base_commit:
+            raise GitBrokerError("requested base commit does not match the pinned job base")
         self._validate_identity(lease.rfc_id, base_commit)
         self._validate_revision(lease.revision_digest)
         if not title.strip() or "\n" in title:
@@ -175,6 +208,7 @@ class GitBroker:
                 raise GitBrokerError("new RFC branch does not start at its declared base")
 
             self.git(worktree, "add", "-A")
+            self._validate_candidate_scope(worktree, base_commit, lease)
             staged = self.git_bytes(
                 worktree,
                 "diff",
@@ -223,6 +257,66 @@ class GitBroker:
             )
             return self._candidate_for_commit(
                 lease, branch, base_commit, commit_sha
+            )
+
+    def _validate_candidate_scope(
+        self, worktree: Path, base_commit: str, lease: JobLease
+    ) -> None:
+        if self.candidate_scope is None:
+            raise GitBrokerError("candidate scope provider is required")
+        scope = self.candidate_scope(lease)
+        if not isinstance(scope, CandidateScope):
+            raise GitBrokerError("candidate scope provider returned an invalid scope")
+        changed_raw = self.git_bytes(
+            worktree,
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_commit,
+            "--",
+        ).stdout
+        changed = [
+            item.decode("utf-8", errors="surrogateescape")
+            for item in changed_raw.split(b"\0")
+            if item
+        ]
+        outside = sorted(path for path in changed if not scope.contains(path))
+        if outside:
+            raise GitBrokerError(
+                "candidate changes paths outside the RFC revision scope: "
+                + ", ".join(outside[:20])
+            )
+
+    def _validate_candidate_commit_scope(
+        self, lease: JobLease, base_commit: str, commit_sha: str
+    ) -> None:
+        if self.candidate_scope is None:
+            raise GitBrokerError("candidate scope provider is required")
+        scope = self.candidate_scope(lease)
+        if not isinstance(scope, CandidateScope):
+            raise GitBrokerError("candidate scope provider returned an invalid scope")
+        changed_raw = self.git_bytes(
+            self.repository,
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_commit,
+            commit_sha,
+            "--",
+        ).stdout
+        changed = [
+            item.decode("utf-8", errors="surrogateescape")
+            for item in changed_raw.split(b"\0")
+            if item
+        ]
+        outside = sorted(path for path in changed if not scope.contains(path))
+        if outside:
+            raise GitBrokerError(
+                "candidate changes paths outside the RFC revision scope: "
+                + ", ".join(outside[:20])
             )
 
     def create_reviewer_snapshot(self, lease: JobLease, candidate: Candidate) -> Path:
@@ -276,12 +370,33 @@ class GitBroker:
         with self.locked():
             self.validate_lease(lease)
             self._validate_candidate_locked(lease, candidate)
+            ref = f"refs/heads/{candidate.branch}"
+            previous = self._remote_tip(remote, ref)
+            if previous is not None:
+                self._require_commit(previous)
+                self._require_ancestor(previous, candidate.commit_sha)
             self.git(
                 self.repository,
                 "push",
                 remote,
-                f"{candidate.commit_sha}:refs/heads/{candidate.branch}",
+                f"{candidate.commit_sha}:{ref}",
             )
+            if self._remote_tip(remote, ref) != candidate.commit_sha:
+                raise GitBrokerError("remote publication did not resolve to the candidate")
+            self.validate_lease(lease)
+
+    def _remote_tip(self, remote: str, ref: str) -> str | None:
+        result = self.git(self.repository, "ls-remote", "--heads", remote, ref)
+        output = result.stdout.strip()
+        if not output:
+            return None
+        rows = output.splitlines()
+        if len(rows) != 1:
+            raise GitBrokerError(f"remote ref resolved ambiguously: {ref}")
+        commit, resolved_ref = rows[0].split("\t", 1)
+        if resolved_ref != ref or not COMMIT_RE.fullmatch(commit):
+            raise GitBrokerError(f"remote ref returned invalid data: {ref}")
+        return commit
 
     def _validate_candidate_locked(
         self, lease: JobLease, candidate: Candidate
@@ -290,6 +405,9 @@ class GitBroker:
         self._require_commit(candidate.base_commit)
         self._require_commit(candidate.commit_sha)
         self._require_ancestor(candidate.base_commit, candidate.commit_sha)
+        self._validate_candidate_commit_scope(
+            lease, candidate.base_commit, candidate.commit_sha
+        )
         branch_tip = self._branch_tip(candidate.branch)
         if branch_tip != candidate.commit_sha:
             raise GitBrokerError("RFC branch no longer identifies the reviewed candidate")
@@ -477,7 +595,15 @@ class GitBroker:
                 "Reviewer Unix identity read-only probe is not configured"
             )
         try:
-            self.reviewer_read_only_probe.verify(snapshot)
+            common_value = self.git(
+                snapshot, "rev-parse", "--git-common-dir"
+            ).stdout.strip()
+            common_dir = Path(common_value)
+            if not common_dir.is_absolute():
+                common_dir = snapshot / common_dir
+            self.reviewer_read_only_probe.verify(
+                snapshot, (self.repository, common_dir.resolve())
+            )
         except RunnerError as exc:
             raise GitBrokerError(f"Reviewer read-only identity check failed: {exc}") from exc
 

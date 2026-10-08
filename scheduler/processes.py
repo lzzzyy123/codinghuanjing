@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from typing import Callable, Mapping, Sequence
 
 from .evidence import redact_text
 from .isolation import IsolationLayout
+from .runner import terminate_process_group
 
 
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
@@ -189,17 +189,7 @@ class FencedProcessExecutor:
 
     @staticmethod
     def _terminate_group(process: subprocess.Popen[str]) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
+        if not terminate_process_group(process):
+            raise ProcessExecutionError(
+                "process did not terminate within the bounded shutdown grace"
+            )

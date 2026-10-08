@@ -10,10 +10,30 @@ from pathlib import Path
 from .state_store import StateStore, utc_now
 
 
-SECRET_PATTERN = re.compile(
-    r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|"
-    r"(?:api[_-]?key|auth[_-]?token|password)\s*[:=]\s*)([^\s,}\]]+)"
+SENSITIVE_KEY = (
+    r"(?:authorization|password|passwd|passphrase|api[_-]?key|"
+    r"(?:auth|access|refresh|session|id)[_-]?token|token|"
+    r"(?:client|api)[_-]?secret|secret[_-]?access[_-]?key|secret|"
+    r"private[_-]?key)"
 )
+
+# JSON output is common in model/provider diagnostics.  Keep the surrounding
+# document valid while replacing both string and scalar credential values.
+JSON_SECRET_PATTERN = re.compile(
+    rf'(?P<prefix>"{SENSITIVE_KEY}"\s*:\s*)'
+    r'(?P<value>"(?:\\.|[^"\\])*"|'
+    r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)",
+    re.IGNORECASE,
+)
+SECRET_PATTERN = re.compile(
+    rf"(authorization\s*[:=]\s*(?:bearer\s+)?|"
+    rf"{SENSITIVE_KEY}\s*[:=]\s*)([^\s,}}\]]+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_json_secret(match: re.Match[str]) -> str:
+    return f'{match.group("prefix")}"[REDACTED]"'
 
 
 def redact_text(value: str, known_secrets: tuple[str, ...] = ()) -> str:
@@ -21,6 +41,7 @@ def redact_text(value: str, known_secrets: tuple[str, ...] = ()) -> str:
     for secret in known_secrets:
         if len(secret) >= 4:
             redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = JSON_SECRET_PATTERN.sub(_redact_json_secret, redacted)
     return SECRET_PATTERN.sub(r"\1[REDACTED]", redacted)
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -81,6 +83,28 @@ class ProcessExecutorTests(unittest.TestCase):
             )
             self.assertTrue(result.timed_out)
             self.assertFalse(result.ok)
+
+    def test_timeout_kills_term_ignoring_group_within_shutdown_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executor = FencedProcessExecutor(
+                IsolationLayout(Path(directory) / "runtime"),
+                "tester-2",
+                "tester",
+            )
+            started = time.monotonic()
+            result = executor.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)",
+                ],
+                Path(directory),
+                label="test-ignore-term",
+                timeout_seconds=0.2,
+            )
+            elapsed = time.monotonic() - started
+            self.assertTrue(result.timed_out)
+            self.assertLess(elapsed, 3.0)
 
 
 if __name__ == "__main__":
