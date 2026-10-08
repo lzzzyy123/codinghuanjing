@@ -6,12 +6,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from watcher import TASK_ID_RE, parse_rfc
+from watcher import (
+    TASK_ID_RE,
+    build_review_candidate,
+    coder_report_errors,
+    parse_rfc,
+)
 
 
 BASE = Path(os.environ.get("CODING_WORKER_HOME", "/openbayes/home/coding-worker")).resolve()
@@ -29,6 +35,44 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def load_status(task_id: str) -> tuple[Path, dict]:
+    status_path = BASE / "reports" / task_id / "status.json"
+    if not status_path.is_file():
+        fail("RFC status does not exist")
+    try:
+        state = json.loads(status_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"invalid status.json: {exc}")
+    return status_path, state
+
+
+def task_is_queued_or_working(task_id: str) -> bool:
+    return any(
+        (BASE / "todo" / name / f"{task_id}.md").exists()
+        for name in ("inbox", "working")
+    )
+
+
+def find_task_rfc(directory: str, task_id: str) -> Path:
+    root = BASE / "todo" / directory
+    exact = root / f"{task_id}.md"
+    if exact.is_file():
+        return exact
+    candidates = sorted(root.glob(f"{task_id}.retry-*.md"), key=lambda path: path.stat().st_mtime)
+    if not candidates:
+        fail(f"RFC source is missing from todo/{directory}")
+    return candidates[-1]
+
+
+def atomic_enqueue_from(source: Path, task_id: str) -> None:
+    destination = BASE / "todo" / "inbox" / f"{task_id}.md"
+    if destination.exists() or (BASE / "todo" / "working" / destination.name).exists():
+        fail("RFC is already queued or working")
+    temporary = destination.with_name(f".control-{task_id}-{os.getpid()}")
+    shutil.copyfile(source, temporary)
+    os.replace(temporary, destination)
 
 
 def git(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -144,6 +188,135 @@ def record_pr(task_id: str, url: str) -> None:
     print(f"Recorded PR for {task_id}: {url}")
 
 
+def retry_review(task_id: str) -> None:
+    if not TASK_ID_RE.fullmatch(task_id):
+        fail("invalid RFC ID")
+    if task_is_queued_or_working(task_id):
+        fail("RFC is already queued or working")
+    status_path, state = load_status(task_id)
+    legacy_format_failure = "Reviewer result did not contain a JSON object with verdict" in str(
+        state.get("failure", "")
+    )
+    if state.get("status") != "review_infra_failed" and not legacy_format_failure:
+        fail("RFC is not eligible for a Reviewer-only infrastructure retry")
+    if state.get("tests_status") != "PASS" or not state.get("tests_passed"):
+        fail("Reviewer-only retry requires previously passing Worker tests")
+    worktree = Path(str(state.get("worktree", ""))).resolve()
+    expected_worktree = (BASE / "worktrees" / task_id).resolve()
+    if worktree != expected_worktree or not worktree.is_dir():
+        fail("RFC worktree is missing or outside the task worktree root")
+    base_commit = str(state.get("base_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", base_commit):
+        fail("RFC base commit is missing or invalid")
+    coder_report_path = BASE / "reports" / task_id / "coder-report.md"
+    if not coder_report_path.is_file():
+        fail("Coder report is missing")
+    coder_report = coder_report_path.read_text(encoding="utf-8").strip()
+    missing = coder_report_errors(coder_report)
+    if missing:
+        fail("Coder report is not reusable: " + ", ".join(missing))
+    rfc_source = find_task_rfc("failed", task_id)
+    metadata, rfc_text = parse_rfc(rfc_source)
+    candidate = build_review_candidate(
+        rfc_text,
+        metadata,
+        base_commit,
+        worktree,
+        base_commit,
+        coder_report,
+    )
+    history = state.get("failure_history", [])
+    if not isinstance(history, list):
+        history = []
+    if state.get("failure"):
+        history.append(
+            {
+                "attempt": state.get("attempts"),
+                "failed_at": state.get("failed_at"),
+                "failure": state["failure"],
+            }
+        )
+    state.update(
+        {
+            "status": "review_infra_failed",
+            "phase": "review_retry_queued",
+            "failure_kind": "REVIEW_INFRA_FAILED",
+            "failure": "REVIEW_INFRA_FAILED: Reviewer-only retry queued after candidate validation",
+            "validated_candidate": candidate,
+            "failure_history": history,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    atomic_json(status_path, state)
+    atomic_enqueue_from(rfc_source, task_id)
+    print(f"Queued Reviewer-only retry for {task_id}; Coder/tests will be reused only if unchanged")
+
+
+AMENDMENT_HEADINGS = (
+    "# Project Lead Amendment",
+    "## Summary",
+    "## Required Changes",
+    "## Reproduction",
+    "## Acceptance Conditions",
+)
+
+
+def enqueue_amendment(task_id: str, upload_name: str) -> None:
+    if not TASK_ID_RE.fullmatch(task_id):
+        fail("invalid RFC ID")
+    if not re.fullmatch(r"\.amend-upload-[A-Za-z0-9._-]+", upload_name):
+        fail("invalid amendment upload filename")
+    if task_is_queued_or_working(task_id):
+        fail("RFC is already queued or working")
+    status_path, state = load_status(task_id)
+    if state.get("status") != "done" or state.get("push") != "PASS":
+        fail("Amendment requires a completed, pushed RFC branch")
+    if state.get("pr_status") == "merged":
+        fail("A merged RFC cannot be amended")
+    upload = BASE / "todo" / "inbox" / upload_name
+    if not upload.is_file():
+        fail("amendment upload is missing")
+    if upload.stat().st_size > 256 * 1024:
+        fail("amendment report exceeds 256 KiB")
+    try:
+        feedback = upload.read_text(encoding="utf-8").strip()
+    except UnicodeDecodeError:
+        fail("amendment report must be UTF-8")
+    missing = [heading for heading in AMENDMENT_HEADINGS if heading not in feedback]
+    if missing:
+        fail("amendment report is missing headings: " + ", ".join(missing))
+    source_rfc = find_task_rfc("done", task_id)
+    amendments_dir = BASE / "reports" / task_id / "amendments"
+    amendments_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(amendments_dir.glob("amendment-*.md"))
+    number = len(existing) + 1
+    amendment_name = f"amendment-{number}.md"
+    amendment_path = amendments_dir / amendment_name
+    os.replace(upload, amendment_path)
+    requested_at = datetime.now(timezone.utc).isoformat()
+    history = state.get("amendment_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append({"number": number, "file": amendment_name, "requested_at": requested_at})
+    state.update(
+        {
+            "status": "amendment_queued",
+            "phase": "amendment_queued",
+            "review": None,
+            "pending_amendment": {
+                "number": number,
+                "file": amendment_name,
+                "requested_at": requested_at,
+            },
+            "amendment_history": history,
+            "updated_at": requested_at,
+        }
+    )
+    atomic_json(status_path, state)
+    atomic_enqueue_from(source_rfc, task_id)
+    print(f"Queued amendment {number} for {task_id} on its existing branch")
+
+
 def enqueue_upload(upload_name: str, final_name: str) -> None:
     if "/" in upload_name or "/" in final_name:
         fail("filenames must not contain paths")
@@ -180,6 +353,10 @@ def main() -> None:
         rfc_status(sys.argv[2])
     elif operation == "record-pr" and len(sys.argv) == 4:
         record_pr(sys.argv[2], sys.argv[3])
+    elif operation == "retry-review" and len(sys.argv) == 3:
+        retry_review(sys.argv[2])
+    elif operation == "enqueue-amendment" and len(sys.argv) == 4:
+        enqueue_amendment(sys.argv[2], sys.argv[3])
     elif operation == "enqueue-upload" and len(sys.argv) == 4:
         enqueue_upload(sys.argv[2], sys.argv[3])
     else:

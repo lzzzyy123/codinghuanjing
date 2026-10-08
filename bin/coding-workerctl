@@ -5,7 +5,7 @@ BASE=/openbayes/home/coding-worker
 CONFIG="$BASE/config/worker.env"
 
 usage() {
-    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|record-pr}"
+    echo "Usage: coding-workerctl {status|start|stop|restart|logs|queue|project|doctor|bootstrap|deploy-key-init|deploy-key-show|bind|rfc-status|retry-review|record-pr|enqueue-amendment}"
 }
 
 load_config() {
@@ -72,6 +72,16 @@ case "${1:-}" in
         load_config
         [ "$#" -eq 3 ] || { usage; exit 2; }
         "$BASE/.venv/bin/python" "$BASE/worker/control.py" record-pr "$2" "$3"
+        ;;
+    retry-review)
+        load_config
+        [ "$#" -eq 2 ] || { usage; exit 2; }
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" retry-review "$2"
+        ;;
+    enqueue-amendment)
+        load_config
+        [ "$#" -eq 3 ] || { usage; exit 2; }
+        "$BASE/.venv/bin/python" "$BASE/worker/control.py" enqueue-amendment "$2" "$3"
         ;;
     enqueue-upload)
         load_config
