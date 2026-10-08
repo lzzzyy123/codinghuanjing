@@ -909,9 +909,25 @@ Container report: `reports/{task_id}/`
 
 
 def update_status(report_dir: Path, state: dict[str, Any], **changes: Any) -> None:
+    sequence = int(state.get("event_sequence", 0) or 0) + 1
     state.update(changes)
     state["updated_at"] = utc_now()
+    state["event_sequence"] = sequence
     atomic_json(report_dir / "status.json", state)
+    event = {
+        "sequence": sequence,
+        "occurred_at": state["updated_at"],
+        "status": state.get("status"),
+        "phase": state.get("phase"),
+        "tests_status": state.get("tests_status"),
+        "review": state.get("review"),
+        "push": state.get("push"),
+        "changes": sorted(changes),
+    }
+    append_text(
+        report_dir / "events.jsonl",
+        json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def configured_commands(metadata: dict[str, Any]) -> dict[str, str]:

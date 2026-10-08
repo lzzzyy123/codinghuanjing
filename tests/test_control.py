@@ -105,6 +105,57 @@ Defect found.
             self.assertTrue((report_dir / "amendments" / "amendment-1.md").is_file())
             self.assertTrue((root / "todo" / "inbox" / f"{RFC_ID}.md").is_file())
 
+    def test_status_updates_append_durable_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_dir = Path(directory) / RFC_ID
+            state = {"rfc": RFC_ID, "status": "working", "phase": "coding"}
+            watcher.update_status(report_dir, state, phase="testing", tests_status="RUNNING")
+            watcher.update_status(report_dir, state, tests_status="PASS")
+
+            status = json.loads((report_dir / "status.json").read_text())
+            events = [
+                json.loads(line)
+                for line in (report_dir / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(status["event_sequence"], 2)
+            self.assertEqual([event["sequence"] for event in events], [1, 2])
+            self.assertEqual(events[0]["changes"], ["phase", "tests_status"])
+            self.assertEqual(events[1]["tests_status"], "PASS")
+
+    def test_wait_rfc_returns_immediately_for_completed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_layout(root)
+            report_dir = root / "reports" / RFC_ID
+            (report_dir / "status.json").write_text(
+                json.dumps({"rfc": RFC_ID, "status": "done", "phase": "complete"})
+            )
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "rfc_status") as show_status,
+            ):
+                control.wait_rfc(RFC_ID, "10")
+            show_status.assert_called_once_with(RFC_ID)
+
+    def test_wait_rfc_times_out_with_current_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_layout(root)
+            report_dir = root / "reports" / RFC_ID
+            (report_dir / "status.json").write_text(
+                json.dumps({"rfc": RFC_ID, "status": "working", "phase": "coding"})
+            )
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "rfc_status") as show_status,
+                mock.patch.object(control.time, "monotonic", side_effect=[0.0, 1.0]),
+                mock.patch.object(control.time, "sleep"),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                control.wait_rfc(RFC_ID, "1")
+            self.assertEqual(raised.exception.code, 124)
+            show_status.assert_called_once_with(RFC_ID)
+
 
 if __name__ == "__main__":
     unittest.main()

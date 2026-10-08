@@ -44,15 +44,17 @@ The tool uploads to a hidden temporary filename, asks the container to validate 
 
 ```bash
 tools/rfc-status.sh RFC-20260924-003
+tools/rfc-wait.sh RFC-20260924-003 3600
 tools/create-pr.sh RFC-20260924-003
 ```
 
-Status reports queued, working, reviewing, done, or failed plus branch, commit, tests, review, push, PR, and compare URL. `create-pr.sh` requires the Mac's `gh` authentication. It reads the Worker-generated PR description, creates or finds the open PR, and records its URL in `status.json`. It never merges.
+`rfc-status.sh` is a point-in-time query. `rfc-wait.sh` keeps one SSH request open until the RFC reaches `done`, `failed`, or `review_infra_failed`, or until its bounded timeout expires; use it instead of shell loops with repeated sleeps. Every status transition is also retained in `reports/<RFC-ID>/events.jsonl`. Status reports include branch, commit, tests, review, push, PR, and compare URL. `create-pr.sh` requires the Mac's `gh` authentication. It reads the Worker-generated PR description, creates or finds the open PR, and records its URL in `status.json`. It never merges.
 
 Before reporting completion, inspect the PR diff and these container artifacts:
 
 ```text
 reports/<RFC-ID>/status.json
+reports/<RFC-ID>/events.jsonl
 reports/<RFC-ID>/coder-report.md
 reports/<RFC-ID>/review-report.md
 reports/<RFC-ID>/tests.log

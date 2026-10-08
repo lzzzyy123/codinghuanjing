@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from watcher import (
     build_review_candidate,
     coder_report_errors,
     parse_rfc,
+    update_status,
 )
 
 
@@ -29,12 +31,6 @@ GIT_REMOTE = os.environ.get("GIT_REMOTE", "origin").strip()
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def atomic_json(path: Path, value: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
 
 
 def load_status(task_id: str) -> tuple[Path, dict]:
@@ -166,6 +162,39 @@ def rfc_status(task_id: str) -> None:
         print(f"Failure: {state['failure']}")
 
 
+TERMINAL_STATUSES = {"done", "failed", "review_infra_failed"}
+
+
+def wait_rfc(task_id: str, timeout_text: str) -> None:
+    """Wait for a terminal RFC state without emitting repetitive status output."""
+    if not TASK_ID_RE.fullmatch(task_id):
+        fail("invalid RFC ID")
+    try:
+        timeout = int(timeout_text)
+    except ValueError:
+        fail("wait timeout must be an integer number of seconds")
+    if timeout < 1 or timeout > 86400:
+        fail("wait timeout must be between 1 and 86400 seconds")
+
+    deadline = time.monotonic() + timeout
+    while True:
+        status_path = BASE / "reports" / task_id / "status.json"
+        if status_path.is_file():
+            try:
+                state = json.loads(status_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                fail(f"invalid status.json: {exc}")
+            if state.get("status") in TERMINAL_STATUSES:
+                rfc_status(task_id)
+                if state.get("status") != "done":
+                    raise SystemExit(2)
+                return
+        if time.monotonic() >= deadline:
+            rfc_status(task_id)
+            raise SystemExit(124)
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def record_pr(task_id: str, url: str) -> None:
     if not TASK_ID_RE.fullmatch(task_id):
         fail("invalid RFC ID")
@@ -184,7 +213,7 @@ def record_pr(task_id: str, url: str) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    atomic_json(status_path, state)
+    update_status(status_path.parent, state)
     print(f"Recorded PR for {task_id}: {url}")
 
 
@@ -247,7 +276,7 @@ def retry_review(task_id: str) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
-    atomic_json(status_path, state)
+    update_status(status_path.parent, state)
     atomic_enqueue_from(rfc_source, task_id)
     print(f"Queued Reviewer-only retry for {task_id}; Coder/tests will be reused only if unchanged")
 
@@ -312,7 +341,7 @@ def enqueue_amendment(task_id: str, upload_name: str) -> None:
             "updated_at": requested_at,
         }
     )
-    atomic_json(status_path, state)
+    update_status(status_path.parent, state)
     atomic_enqueue_from(source_rfc, task_id)
     print(f"Queued amendment {number} for {task_id} on its existing branch")
 
@@ -351,6 +380,8 @@ def main() -> None:
         project_status()
     elif operation == "rfc-status" and len(sys.argv) == 3:
         rfc_status(sys.argv[2])
+    elif operation == "wait-rfc" and len(sys.argv) == 4:
+        wait_rfc(sys.argv[2], sys.argv[3])
     elif operation == "record-pr" and len(sys.argv) == 4:
         record_pr(sys.argv[2], sys.argv[3])
     elif operation == "retry-review" and len(sys.argv) == 3:

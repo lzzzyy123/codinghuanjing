@@ -125,6 +125,7 @@ Configure ignored `tools/client.env` from its example, then:
 ```bash
 tools/submit-rfc.sh RFC-20260924-003.md
 tools/rfc-status.sh RFC-20260924-003
+tools/rfc-wait.sh RFC-20260924-003 3600
 tools/create-pr.sh RFC-20260924-003
 ```
 
@@ -136,6 +137,7 @@ Each `reports/<RFC-ID>/` contains:
 
 ```text
 status.json             machine state, branch, base commit, commit, push, PR
+events.jsonl            append-only lifecycle transition stream for efficient waiting/audit
 coder-report.md         implementation, files, decisions, alternatives, deviations, risks
 review-report.md        human-readable acceptance/security/architecture/test review
 coder-attempt-*.md      per-cycle Coder report history
