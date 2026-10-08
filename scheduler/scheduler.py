@@ -73,6 +73,46 @@ class DagScheduler:
                 return
             connection.execute("INSERT INTO merge_records VALUES (?, ?, ?, ?, ?, ?)", values)
 
+    def record_base_delivery(
+        self,
+        merged_base_commit: str,
+        recorded_by: str,
+        *,
+        ancestor_verified: bool,
+    ) -> None:
+        required_rfc = self.registry.base_delivery_rfc
+        required_commit = self.registry.base_delivery_commit
+        if required_rfc is None or required_commit is None:
+            raise StateConflict("registry has no external base delivery gate")
+        if not COMMIT_RE.fullmatch(merged_base_commit):
+            raise ValueError("merged_base_commit must be a full Git SHA")
+        if not ancestor_verified:
+            raise StateConflict("base delivery requires verified Git ancestry")
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM base_delivery_records WHERE required_rfc_id = ?",
+                (required_rfc,),
+            ).fetchone()
+            values = (
+                required_rfc,
+                required_commit,
+                merged_base_commit,
+                1,
+                recorded_by,
+                utc_now(),
+            )
+            if existing:
+                if (
+                    existing["required_commit"] != required_commit
+                    or existing["merged_base_commit"] != merged_base_commit
+                    or not existing["ancestor_verified"]
+                ):
+                    raise StateConflict("conflicting external base delivery evidence")
+                return
+            connection.execute(
+                "INSERT INTO base_delivery_records VALUES (?, ?, ?, ?, ?, ?)", values
+            )
+
     def refresh_ready(self, actor: str = "dag-scheduler") -> dict[str, list[str]]:
         ready: list[str] = []
         blocked: list[str] = []
@@ -81,11 +121,27 @@ class DagScheduler:
                 row["rfc_id"]: dict(row)
                 for row in connection.execute("SELECT * FROM merge_records").fetchall()
             }
+            base_ready = True
+            if self.registry.base_delivery_rfc:
+                base = connection.execute(
+                    "SELECT * FROM base_delivery_records WHERE required_rfc_id = ?",
+                    (self.registry.base_delivery_rfc,),
+                ).fetchone()
+                base_ready = bool(
+                    base
+                    and base["required_commit"] == self.registry.base_delivery_commit
+                    and base["ancestor_verified"]
+                )
         for rfc_id in self.registry.topological_order:
             task = self.store.task(rfc_id)
             if task["state"] != TaskState.VALIDATED.value:
                 continue
             rfc = self.registry.rfcs[rfc_id]
+            if not base_ready:
+                blocked.append(
+                    f"{rfc_id}: external base {self.registry.base_delivery_rfc} is not merged and ancestry-verified"
+                )
+                continue
             reason = self._dependency_blocker(rfc.depends_on, rfc.requires, merges)
             if reason is None:
                 self.store.transition(
@@ -99,6 +155,39 @@ class DagScheduler:
             else:
                 blocked.append(f"{rfc_id}: {reason}")
         return {"ready": ready, "blocked": blocked}
+
+    def readiness_blockers(self) -> list[str]:
+        with self.store.connect() as connection:
+            merges = {
+                row["rfc_id"]: dict(row)
+                for row in connection.execute("SELECT * FROM merge_records").fetchall()
+            }
+            base_ready = True
+            if self.registry.base_delivery_rfc:
+                base = connection.execute(
+                    "SELECT * FROM base_delivery_records WHERE required_rfc_id = ?",
+                    (self.registry.base_delivery_rfc,),
+                ).fetchone()
+                base_ready = bool(
+                    base
+                    and base["required_commit"] == self.registry.base_delivery_commit
+                    and base["ancestor_verified"]
+                )
+        blockers: list[str] = []
+        for rfc_id in self.registry.topological_order:
+            task = self.store.task(rfc_id)
+            if task["state"] != TaskState.VALIDATED.value:
+                continue
+            if not base_ready:
+                blockers.append(
+                    f"{rfc_id}: external base {self.registry.base_delivery_rfc} is not merged and ancestry-verified"
+                )
+                continue
+            rfc = self.registry.rfcs[rfc_id]
+            reason = self._dependency_blocker(rfc.depends_on, rfc.requires, merges)
+            if reason:
+                blockers.append(f"{rfc_id}: {reason}")
+        return blockers
 
     def _dependency_blocker(
         self,

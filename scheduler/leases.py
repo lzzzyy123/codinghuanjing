@@ -168,11 +168,24 @@ class QueueStore:
                 "ORDER BY jobs.priority DESC, jobs.job_id",
                 (role, *sorted(allowed_kinds), timestamp),
             ).fetchall()
+            active_locks: set[str] = set()
+            active_revisions = connection.execute(
+                "SELECT rfc_revisions.payload_json FROM leases "
+                "JOIN jobs ON jobs.job_id = leases.job_id "
+                "JOIN rfc_revisions ON rfc_revisions.revision_digest = jobs.revision_digest "
+                "WHERE leases.expires_at > ?",
+                (timestamp,),
+            ).fetchall()
+            for active_revision in active_revisions:
+                payload = json.loads(active_revision["payload_json"])
+                active_locks.update(str(item) for item in payload.get("lock_keys", []))
             job = next(
                 (
                     row
                     for row in rows
                     if row["task_state"] in CLAIMABLE_TASK_STATES[str(row["kind"])]
+                    and not self._revision_lock_keys(connection, row["revision_digest"])
+                    .intersection(active_locks)
                 ),
                 None,
             )
@@ -545,6 +558,17 @@ class QueueStore:
         if float(row["expires_at"]) <= now:
             raise LeaseError("lease has expired")
         return row
+
+    @staticmethod
+    def _revision_lock_keys(connection, revision_digest: str) -> set[str]:
+        row = connection.execute(
+            "SELECT payload_json FROM rfc_revisions WHERE revision_digest = ?",
+            (revision_digest,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict(f"missing RFC revision {revision_digest}")
+        payload = json.loads(row["payload_json"])
+        return {str(item) for item in payload.get("lock_keys", [])}
 
     @staticmethod
     def _enqueue_in_transaction(

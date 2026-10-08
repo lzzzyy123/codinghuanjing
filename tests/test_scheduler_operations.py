@@ -31,6 +31,7 @@ class OperationsTests(unittest.TestCase):
             result = replay_legacy_reports(reports)
             self.assertEqual(result.tasks, 1)
             self.assertEqual(result.events, 2)
+            self.assertEqual(result.legacy_status_only, 0)
             self.assertEqual(result.anomalies, ())
             self.assertEqual(result.as_dict()["terminal_duration_median_seconds"], 600)
 

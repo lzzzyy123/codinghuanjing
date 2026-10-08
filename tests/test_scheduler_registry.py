@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -111,6 +112,35 @@ class RegistryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RegistryError, "provider has"):
             load(document([first, second]))
+
+    def test_exact_classification_partition_is_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            classification = root / "classification.json"
+            content = json.dumps(
+                [
+                    {
+                        "path": "a.py",
+                        "disposition": "in_scope",
+                        "capability": "test",
+                    }
+                ]
+            ).encode()
+            classification.write_bytes(content)
+            value = document([rfc("RFC-20261008-056", "a.py", "a.ts")])
+            value["baseline"]["in_scope_count"] = 1
+            value["baseline"]["classification_sha256"] = (
+                "sha256:" + hashlib.sha256(content).hexdigest()
+            )
+            path = root / "dag.json"
+            path.write_text(json.dumps(value))
+            registry = load_registry(path, classification)
+            self.assertEqual(registry.in_scope_count, 1)
+            value["rfcs"][0]["python_sources"] = ["missing.py"]
+            value["rfcs"][0] = with_revision_digest(value["rfcs"][0])
+            path.write_text(json.dumps(value))
+            with self.assertRaisesRegex(RegistryError, "source partition mismatch"):
+                load_registry(path, classification)
 
 
 if __name__ == "__main__":

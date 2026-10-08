@@ -19,9 +19,11 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate")
     validate.add_argument("dag", type=Path)
+    validate.add_argument("classification", type=Path, nargs="?")
     initialize = commands.add_parser("init")
     initialize.add_argument("dag", type=Path)
     initialize.add_argument("database", type=Path)
+    initialize.add_argument("classification", type=Path, nargs="?")
     status = commands.add_parser("status")
     status.add_argument("dag", type=Path)
     status.add_argument("database", type=Path)
@@ -39,10 +41,10 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     if args.command == "validate":
-        registry = load_registry(args.dag)
+        registry = load_registry(args.dag, args.classification)
         print(json.dumps({"valid": True, "digest": registry.digest, "rfcs": len(registry.rfcs)}))
     elif args.command == "init":
-        registry = load_registry(args.dag)
+        registry = load_registry(args.dag, args.classification)
         store = StateStore(args.database, args.database.parent / "evidence")
         store.import_registry(registry)
         scheduler = DagScheduler(registry, store)

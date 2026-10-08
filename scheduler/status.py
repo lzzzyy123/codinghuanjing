@@ -8,6 +8,7 @@ from typing import Any
 
 from .models import TaskState
 from .registry import Registry
+from .scheduler import DagScheduler
 from .state_store import StateStore
 
 
@@ -55,6 +56,7 @@ def status_snapshot(registry: Registry, store: StateStore) -> dict[str, Any]:
         "leases": leases,
         "critical_path": critical_path(registry, merged),
         "blockers": blockers,
+        "admission_blockers": DagScheduler(registry, store).readiness_blockers(),
         "merged": sorted(merged),
     }
 

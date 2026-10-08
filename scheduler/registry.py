@@ -94,6 +94,9 @@ class Registry:
     baseline_commit: str
     classification_sha256: str
     in_scope_count: int
+    baseline_tree: str | None
+    base_delivery_rfc: str | None
+    base_delivery_commit: str | None
     rfcs: dict[str, RfcRevision]
     topological_order: tuple[str, ...]
     digest: str
@@ -133,8 +136,17 @@ def _parse_rfc(value: object, index: int) -> RfcRevision:
         )
     sources = tuple(
         normalized_relative_path(item, f"{rfc_id}.python_sources")
-        for item in string_list(value.get("python_sources"), f"{rfc_id}.python_sources")
+        for item in string_list(
+            value.get("python_sources"), f"{rfc_id}.python_sources", non_empty=False
+        )
     )
+    if not sources and not value.get("source_coverage_exempt_reason"):
+        raise RegistryError(
+            f"{rfc_id} has no in-scope sources and requires source_coverage_exempt_reason"
+        )
+    source_digest = value.get("source_files_sha256")
+    if source_digest is not None and source_digest != content_digest(list(sources)):
+        raise RegistryError(f"{rfc_id}.source_files_sha256 mismatch")
     targets = tuple(
         normalized_relative_path(item, f"{rfc_id}.target_files")
         for item in string_list(value.get("target_files"), f"{rfc_id}.target_files")
@@ -247,7 +259,7 @@ def _validate_contracts(registry: Registry) -> None:
                 )
 
 
-def load_registry(path: Path) -> Registry:
+def load_registry(path: Path, classification_path: Path | None = None) -> Registry:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -260,10 +272,13 @@ def load_registry(path: Path) -> Registry:
     if not isinstance(baseline, dict):
         raise RegistryError("baseline must be an object")
     commit = baseline.get("commit")
+    tree = baseline.get("tree")
     classification = baseline.get("classification_sha256")
     count = baseline.get("in_scope_count")
     if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
         raise RegistryError("baseline.commit must be a full Git SHA")
+    if tree is not None and (not isinstance(tree, str) or not COMMIT_RE.fullmatch(tree)):
+        raise RegistryError("baseline.tree must be a full Git SHA")
     if not isinstance(classification, str) or not SHA256_RE.fullmatch(classification):
         raise RegistryError("baseline.classification_sha256 must be a sha256 digest")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
@@ -283,12 +298,63 @@ def load_registry(path: Path) -> Registry:
         baseline_commit=commit,
         classification_sha256=classification,
         in_scope_count=count,
+        baseline_tree=tree,
+        base_delivery_rfc=None,
+        base_delivery_commit=None,
         rfcs=rfcs,
         topological_order=order,
         digest=content_digest(document),
     )
+    base_delivery = document.get("base_delivery")
+    if base_delivery is not None:
+        if not isinstance(base_delivery, dict):
+            raise RegistryError("base_delivery must be an object")
+        base_rfc = base_delivery.get("rfc")
+        base_commit = base_delivery.get("commit")
+        if not isinstance(base_rfc, str) or not RFC_ID_RE.fullmatch(base_rfc):
+            raise RegistryError("base_delivery.rfc is invalid")
+        if not isinstance(base_commit, str) or not COMMIT_RE.fullmatch(base_commit):
+            raise RegistryError("base_delivery.commit must be a full Git SHA")
+        if base_delivery.get("required_merge_state") != "merged":
+            raise RegistryError("base_delivery.required_merge_state must be merged")
+        object.__setattr__(registry, "base_delivery_rfc", base_rfc)
+        object.__setattr__(registry, "base_delivery_commit", base_commit)
     _validate_contracts(registry)
+    if classification_path is not None:
+        validate_exact_partition(registry, classification_path)
     return registry
+
+
+def validate_exact_partition(registry: Registry, classification_path: Path) -> None:
+    try:
+        content = classification_path.read_bytes()
+        classification = json.loads(content)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"cannot load classification {classification_path}: {exc}") from exc
+    actual_digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    if actual_digest != registry.classification_sha256:
+        raise RegistryError(
+            f"classification digest mismatch: expected {registry.classification_sha256}, got {actual_digest}"
+        )
+    if not isinstance(classification, list):
+        raise RegistryError("classification root must be a list")
+    expected: set[str] = set()
+    for index, entry in enumerate(classification):
+        if not isinstance(entry, dict):
+            raise RegistryError(f"classification[{index}] must be an object")
+        if entry.get("disposition") == "in_scope":
+            expected.add(normalized_relative_path(entry.get("path"), "classification.path"))
+    actual = {path for rfc in registry.rfcs.values() for path in rfc.python_sources}
+    if len(expected) != registry.in_scope_count:
+        raise RegistryError(
+            f"classification contains {len(expected)} in-scope paths, expected {registry.in_scope_count}"
+        )
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise RegistryError(
+            f"RFC source partition mismatch; missing={missing[:10]}, extra={extra[:10]}"
+        )
 
 
 def with_revision_digest(value: dict[str, Any]) -> dict[str, Any]:

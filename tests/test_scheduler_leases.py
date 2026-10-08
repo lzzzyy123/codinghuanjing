@@ -21,6 +21,7 @@ def setup(root: Path) -> tuple[StateStore, QueueStore]:
             "revision": 1,
             "python_sources": ["hermes/agent.py"],
             "target_files": ["src/agent.ts"],
+            "lock_keys": ["shared-registry"],
             "depends_on": [],
             "contracts": {"provides": {}, "requires": {}},
             "tests": {"level1": ["bun run typecheck"], "level2": ["bun test"]},
@@ -112,6 +113,54 @@ class LeaseTests(unittest.TestCase):
                 queue.enqueue(
                     "RFC-20261008-056", "coding", "same", candidate_digest="changed"
                 )
+
+    def test_shared_lock_key_prevents_uncoordinated_parallel_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, queue = setup(root)
+            with store.connect() as connection:
+                first = json.loads(
+                    connection.execute(
+                        "SELECT payload_json FROM rfc_revisions WHERE rfc_id = ?",
+                        ("RFC-20261008-056",),
+                    ).fetchone()["payload_json"]
+                )
+            second = with_revision_digest(
+                {
+                    **{key: value for key, value in first.items() if key != "revision_digest"},
+                    "id": "RFC-20261008-057",
+                    "title": "Second",
+                    "python_sources": ["hermes/second.py"],
+                    "target_files": ["src/second.ts"],
+                }
+            )
+            dag = root / "dag-two.json"
+            dag.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "baseline": {
+                            "commit": "a" * 40,
+                            "classification_sha256": "sha256:" + "b" * 64,
+                            "in_scope_count": 806,
+                        },
+                        "rfcs": [first, second],
+                    }
+                )
+            )
+            store.import_registry(load_registry(dag))
+            store.transition(second["id"], TaskState.DRAFT, TaskState.VALIDATED, "validator")
+            store.transition(second["id"], TaskState.VALIDATED, TaskState.READY, "scheduler")
+            queue.register_agent("coder-a", "coder", "xiaosuan-8", "pid:1", now=0)
+            queue.register_agent("coder-b", "coder", "xiaosuan-8", "pid:2", now=0)
+            queue.enqueue("RFC-20261008-056", "coding", "coding:one", available_at=0)
+            queue.enqueue("RFC-20261008-057", "coding", "coding:two", available_at=0)
+            first_lease = queue.claim("coder-a", now=0, lease_seconds=100)
+            self.assertEqual(first_lease.rfc_id, "RFC-20261008-056")
+            self.assertIsNone(queue.claim("coder-b", now=1, lease_seconds=100))
+            queue.finish(first_lease, "passed", {}, now=2)
+            second_lease = queue.claim("coder-b", now=3, lease_seconds=100)
+            self.assertEqual(second_lease.rfc_id, "RFC-20261008-057")
 
 
 if __name__ == "__main__":

@@ -88,6 +88,42 @@ class ReadinessTests(unittest.TestCase):
             result = scheduler.refresh_ready()
             self.assertEqual(result["ready"], [second["id"]])
 
+    def test_external_base_delivery_blocks_roots_until_ancestry_is_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = item("RFC-20261008-056", 1)
+            path = root / "dag.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "baseline": {
+                            "commit": "a" * 40,
+                            "classification_sha256": "sha256:" + "b" * 64,
+                            "in_scope_count": 1,
+                        },
+                        "base_delivery": {
+                            "rfc": "RFC-20261008-055",
+                            "commit": "c" * 40,
+                            "required_merge_state": "merged",
+                        },
+                        "rfcs": [first],
+                    }
+                )
+            )
+            registry = load_registry(path)
+            store = StateStore(root / "state.sqlite3")
+            store.import_registry(registry)
+            scheduler = DagScheduler(registry, store)
+            scheduler.validate_tasks()
+            result = scheduler.refresh_ready()
+            self.assertEqual(result["ready"], [])
+            self.assertRegex(result["blocked"][0], "not merged")
+            with self.assertRaisesRegex(StateConflict, "verified Git ancestry"):
+                scheduler.record_base_delivery("d" * 40, "lead", ancestor_verified=False)
+            scheduler.record_base_delivery("d" * 40, "lead", ancestor_verified=True)
+            self.assertEqual(scheduler.refresh_ready()["ready"], [first["id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

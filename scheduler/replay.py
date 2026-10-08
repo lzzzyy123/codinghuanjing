@@ -14,6 +14,7 @@ class ReplayResult:
     tasks: int
     statuses: dict[str, int]
     events: int
+    legacy_status_only: int
     anomalies: tuple[str, ...]
     durations_seconds: tuple[float, ...]
 
@@ -31,6 +32,7 @@ class ReplayResult:
             "tasks": self.tasks,
             "statuses": self.statuses,
             "events": self.events,
+            "legacy_status_only": self.legacy_status_only,
             "anomalies": list(self.anomalies),
             "terminal_duration_median_seconds": median,
         }
@@ -50,6 +52,7 @@ def replay_legacy_reports(root: Path) -> ReplayResult:
     anomalies: list[str] = []
     durations: list[float] = []
     events_count = 0
+    legacy_status_only = 0
     status_paths = sorted(root.glob("*/status.json"))
     for status_path in status_paths:
         task_id = status_path.parent.name
@@ -65,7 +68,7 @@ def replay_legacy_reports(root: Path) -> ReplayResult:
             durations.append((ended - started).total_seconds())
         events_path = status_path.parent / "events.jsonl"
         if not events_path.is_file():
-            anomalies.append(f"{task_id}: events.jsonl missing")
+            legacy_status_only += 1
             continue
         previous = 0
         for line_number, line in enumerate(
@@ -97,6 +100,7 @@ def replay_legacy_reports(root: Path) -> ReplayResult:
         tasks=len(status_paths),
         statuses=dict(sorted(statuses.items())),
         events=events_count,
+        legacy_status_only=legacy_status_only,
         anomalies=tuple(anomalies),
         durations_seconds=tuple(durations),
     )

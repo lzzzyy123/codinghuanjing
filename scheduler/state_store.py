@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS merge_records (
     recorded_by TEXT NOT NULL,
     recorded_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS base_delivery_records (
+    required_rfc_id TEXT PRIMARY KEY,
+    required_commit TEXT NOT NULL,
+    merged_base_commit TEXT NOT NULL,
+    ancestor_verified INTEGER NOT NULL,
+    recorded_by TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
     role TEXT NOT NULL,
