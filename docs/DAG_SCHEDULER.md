@@ -41,7 +41,7 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
 - Coder author identity is candidate-pinned. Agent role/model/process identity is immutable, and Reviewer Agent/process identity must differ from the Coder's.
 - Coding jobs pin an exact Git base commit. Operator delivery commands first fetch remote `main` into a dedicated trusted ref, then bind base-delivery and dependency merge evidence to the fetched commit and verified ancestry.
 - Git commits and pushes pass through the single-writer broker. Reviewer input is a detached read-only snapshot.
-- Remote publication journaling/reconciliation, trusted-main fetch freshness, supervised test receipts, kernel process containment and verified UID/GID separation are mandatory cutover blockers; shadow mode does not claim them.
+- Remote publication uses a durable pre-push journal and read-only ref reconciler; active-runner startup wiring, trusted-main fetch freshness, supervised test receipts, kernel process containment and verified UID/GID separation remain mandatory cutover blockers. Shadow mode does not claim them.
 - `Done` means Level 3 passed for the reviewed candidate. It does not mean merged. No component automatically merges main.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 

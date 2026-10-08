@@ -55,6 +55,12 @@ def status_snapshot(registry: Registry, store: StateStore) -> dict[str, Any]:
                 "SELECT * FROM review_runs ORDER BY rfc_id, review_run_id"
             )
         ]
+        publications = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM publication_records ORDER BY publication_id"
+            )
+        ]
         merge_rows = [
             dict(row)
             for row in connection.execute("SELECT * FROM merge_records ORDER BY rfc_id")
@@ -87,7 +93,7 @@ def status_snapshot(registry: Registry, store: StateStore) -> dict[str, Any]:
             and isinstance(row.get("trusted_main_commit"), str)
             and COMMIT_RE.fullmatch(row["trusted_main_commit"])
         }
-    evidence = _evidence_by_rfc(candidates, tests, reviews, merge_rows)
+    evidence = _evidence_by_rfc(candidates, tests, reviews, publications, merge_rows)
     active_by_agent = {
         lease["holder_agent_id"]: lease for lease in leases
     }
@@ -135,8 +141,15 @@ def status_snapshot(registry: Registry, store: StateStore) -> dict[str, Any]:
             "candidates": len(candidates),
             "test_runs": len(tests),
             "review_runs": len(reviews),
+            "publications": len(publications),
             "merges": len(merge_rows),
         },
+        "publication_pending": [
+            row for row in publications if row["state"] in {"prepared", "published"}
+        ],
+        "publication_blockers": [
+            row for row in publications if row["state"] == "blocked"
+        ],
         "base_deliveries": base_deliveries,
         "migration_blockers": migration_blockers,
         "critical_path": critical_path(registry, merged),
@@ -164,13 +177,20 @@ def _agent_status(
 
 
 def _empty_evidence() -> dict[str, Any]:
-    return {"candidate": None, "tests": {}, "review": None, "merge": None}
+    return {
+        "candidate": None,
+        "tests": {},
+        "review": None,
+        "publication": None,
+        "merge": None,
+    }
 
 
 def _evidence_by_rfc(
     candidates: list[dict[str, Any]],
     tests: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
+    publications: list[dict[str, Any]],
     merges: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
@@ -183,6 +203,9 @@ def _evidence_by_rfc(
     for review in reviews:
         item = result.setdefault(review["rfc_id"], _empty_evidence())
         item["review"] = review
+    for publication in publications:
+        item = result.setdefault(publication["rfc_id"], _empty_evidence())
+        item["publication"] = publication
     for merge in merges:
         item = result.setdefault(merge["rfc_id"], _empty_evidence())
         item["merge"] = merge

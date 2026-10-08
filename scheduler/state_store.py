@@ -214,6 +214,29 @@ CREATE TABLE IF NOT EXISTS candidate_records (
     created_at TEXT NOT NULL,
     PRIMARY KEY(rfc_id, revision_digest, candidate_digest)
 );
+CREATE TABLE IF NOT EXISTS publication_records (
+    publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rfc_id TEXT NOT NULL,
+    revision_digest TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
+    remote TEXT NOT NULL,
+    ref_name TEXT NOT NULL,
+    previous_commit TEXT,
+    target_commit TEXT NOT NULL,
+    state TEXT NOT NULL,
+    observed_commit TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(rfc_id, revision_digest, candidate_digest, remote, ref_name, target_commit)
+);
+CREATE INDEX IF NOT EXISTS publication_records_state_idx
+    ON publication_records(state, publication_id);
+CREATE UNIQUE INDEX IF NOT EXISTS publication_records_active_ref_idx
+    ON publication_records(remote, ref_name)
+    WHERE state IN ('prepared', 'published', 'blocked');
 CREATE TABLE IF NOT EXISTS migration_blockers (
     blocker_key TEXT PRIMARY KEY,
     kind TEXT NOT NULL,

@@ -300,8 +300,16 @@ class SchedulerCliTests(unittest.TestCase):
             snapshot = json.loads(stdout)
             self.assertEqual(
                 snapshot["evidence_counts"],
-                {"candidates": 0, "test_runs": 0, "review_runs": 0, "merges": 0},
+                {
+                    "candidates": 0,
+                    "test_runs": 0,
+                    "review_runs": 0,
+                    "publications": 0,
+                    "merges": 0,
+                },
             )
+            self.assertEqual(snapshot["publication_pending"], [])
+            self.assertEqual(snapshot["publication_blockers"], [])
             self.assertIn("elapsed_seconds", snapshot["tasks"][0])
             self.assertIn("evidence", snapshot["tasks"][0])
 

@@ -17,6 +17,7 @@ from typing import Callable, Iterator, Sequence
 
 from .isolation import IsolationLayout
 from .leases import JobLease
+from .publication import PublicationJournal
 from .runner import ReviewerReadOnlyProbe, RunnerError, RunnerTimeout, run_bounded
 
 
@@ -78,6 +79,7 @@ class GitBroker:
         command_prefix: Sequence[str] = (),
         git_timeout_seconds: float = 120,
         reviewer_read_only_probe: ReviewerReadOnlyProbe | None = None,
+        publication_journal: PublicationJournal | None = None,
     ) -> None:
         self.repository = repository.resolve()
         self.layout = layout
@@ -89,6 +91,7 @@ class GitBroker:
             raise ValueError("git_timeout_seconds must be positive")
         self.git_timeout_seconds = git_timeout_seconds
         self.reviewer_read_only_probe = reviewer_read_only_probe
+        self.publication_journal = publication_journal
         if not (self.repository / ".git").exists():
             raise ValueError("repository must be a non-bare Git checkout")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,6 +370,8 @@ class GitBroker:
     ) -> None:
         if not REMOTE_RE.fullmatch(remote):
             raise ValueError("invalid Git remote")
+        if self.publication_journal is None:
+            raise GitBrokerError("remote publication requires a durable journal")
         with self.locked():
             self.validate_lease(lease)
             self._validate_candidate_locked(lease, candidate)
@@ -375,15 +380,79 @@ class GitBroker:
             if previous is not None:
                 self._require_commit(previous)
                 self._require_ancestor(previous, candidate.commit_sha)
-            self.git(
-                self.repository,
-                "push",
-                remote,
-                f"{candidate.commit_sha}:{ref}",
+            preparation = self.publication_journal.prepare(
+                rfc_id=candidate.rfc_id,
+                revision_digest=candidate.revision_digest,
+                candidate_digest=candidate.candidate_digest,
+                lease_id=lease.lease_id,
+                fencing_token=lease.fencing_token,
+                remote=remote,
+                ref_name=ref,
+                previous_commit=previous,
+                target_commit=candidate.commit_sha,
             )
-            if self._remote_tip(remote, ref) != candidate.commit_sha:
-                raise GitBrokerError("remote publication did not resolve to the candidate")
-            self.validate_lease(lease)
+            publication_id = preparation.publication_id
+            if preparation.state == "confirmed":
+                self.validate_lease(lease)
+                return
+            try:
+                if previous != candidate.commit_sha:
+                    self.git(
+                        self.repository,
+                        "push",
+                        remote,
+                        f"{candidate.commit_sha}:{ref}",
+                    )
+                observed = self._remote_tip(remote, ref)
+                if observed != candidate.commit_sha:
+                    raise GitBrokerError(
+                        "remote publication did not resolve to the candidate"
+                    )
+                self.publication_journal.mark_published(
+                    publication_id,
+                    observed,
+                    lease_id=lease.lease_id,
+                    fencing_token=lease.fencing_token,
+                )
+                self.validate_lease(lease)
+                self.publication_journal.confirm(
+                    publication_id,
+                    lease_id=lease.lease_id,
+                    fencing_token=lease.fencing_token,
+                )
+            except Exception as exc:
+                try:
+                    self.publication_journal.note_error(
+                        publication_id,
+                        str(exc),
+                        lease_id=lease.lease_id,
+                        fencing_token=lease.fencing_token,
+                    )
+                except Exception as journal_exc:
+                    exc.add_note(
+                        "publication journal could not record the failure: "
+                        f"{journal_exc}"
+                    )
+                raise
+
+    def reconcile_publications(self) -> dict[str, int]:
+        """Compare unfinished journal intents with remote refs without moving them."""
+        if self.publication_journal is None:
+            raise GitBrokerError("publication reconciliation requires a durable journal")
+        counts = {"published": 0, "not_published": 0, "blocked": 0}
+        with self.locked():
+            for record in self.publication_journal.pending():
+                if not REMOTE_RE.fullmatch(record.remote):
+                    state = self.publication_journal.reconcile(
+                        record.publication_id, None
+                    )
+                else:
+                    observed = self._remote_tip(record.remote, record.ref_name)
+                    state = self.publication_journal.reconcile(
+                        record.publication_id, observed
+                    )
+                counts[state] = counts.get(state, 0) + 1
+        return counts
 
     def _remote_tip(self, remote: str, ref: str) -> str | None:
         result = self.git(self.repository, "ls-remote", "--heads", remote, ref)
