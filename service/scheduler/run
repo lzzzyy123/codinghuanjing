@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+exec 2>&1
+
+BASE=/openbayes/home/coding-worker
+set -a
+. "$BASE/config/worker.env"
+set +a
+
+: "${SCHEDULER_DAG:?SCHEDULER_DAG is required for the optional shadow scheduler service}"
+: "${SCHEDULER_CLASSIFICATION:?SCHEDULER_CLASSIFICATION is required}"
+SCHEDULER_DB=${SCHEDULER_DB:-$BASE/runtime/scheduler/state.sqlite3}
+SCHEDULER_EVIDENCE_ROOT=${SCHEDULER_EVIDENCE_ROOT:-$BASE/reports/scheduler}
+
+cd "$BASE"
+exec "$BASE/.venv/bin/python" -m scheduler.daemon \
+  --mode "${SCHEDULER_MODE:-shadow}" \
+  --dag "$SCHEDULER_DAG" \
+  --classification "$SCHEDULER_CLASSIFICATION" \
+  --database "$SCHEDULER_DB" \
+  --evidence-root "$SCHEDULER_EVIDENCE_ROOT"

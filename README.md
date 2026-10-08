@@ -158,6 +158,8 @@ For a Project Lead defect found before merge, `tools/amend-rfc.sh RFC-ID REPORT.
 
 The current deployment remains single-Worker. [docs/MULTI_WORKER_EXPANSION.md](docs/MULTI_WORKER_EXPANSION.md) defines the ownership, dependency, isolation, and integration gates required before an operator-approved 2-4 Worker rollout.
 
+The additive DAG scheduler implementation and its shadow-first cutover contract are documented in [docs/DAG_SCHEDULER.md](docs/DAG_SCHEDULER.md). Shadow mode does not claim the production filesystem queue, start Agents, alter `MAX_CONCURRENT_TASKS=1`, or replace the current runit service.
+
 ## Operations
 
 ```bash
