@@ -214,18 +214,6 @@ else:
         report("PROJECT_ROOT", "FAIL", f"not a Git repository: {PROJECT}")
     else:
         report("PROJECT_ROOT", "PASS", str(PROJECT))
-        metadata_path = PROJECT / "baseline" / "metadata.json"
-        try:
-            project_baseline = json.loads(metadata_path.read_text(encoding="utf-8"))
-            project_commit = project_baseline["baseline"]["commit"]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError):
-            project_commit = None
-        if PYTHON_BASELINE_COMMIT:
-            report(
-                "Project/reference baseline identity",
-                "PASS" if project_commit == PYTHON_BASELINE_COMMIT else "FAIL",
-                "exact commit matches" if project_commit == PYTHON_BASELINE_COMMIT else "commit mismatch",
-            )
         metadata_check = command(
             [
                 "chpst",
@@ -271,6 +259,25 @@ else:
             if command_check("Git fetch", fetch_result, f"{GIT_REMOTE}/{BASE_BRANCH}"):
                 base_result = git("rev-parse", "--verify", f"refs/remotes/{GIT_REMOTE}/{BASE_BRANCH}")
                 if command_check("Base branch", base_result, BASE_BRANCH):
+                    if PYTHON_BASELINE_COMMIT:
+                        metadata_result = git(
+                            "show",
+                            f"refs/remotes/{GIT_REMOTE}/{BASE_BRANCH}:baseline/metadata.json",
+                        )
+                        project_commit = None
+                        if not isinstance(metadata_result, Exception) and metadata_result.returncode == 0:
+                            try:
+                                project_baseline = json.loads(metadata_result.stdout)
+                                project_commit = project_baseline["baseline"]["commit"]
+                            except (KeyError, TypeError, json.JSONDecodeError):
+                                pass
+                        report(
+                            "Project/reference baseline identity",
+                            "PASS" if project_commit == PYTHON_BASELINE_COMMIT else "FAIL",
+                            "exact fetched-base commit matches"
+                            if project_commit == PYTHON_BASELINE_COMMIT
+                            else "fetched-base commit mismatch or metadata missing",
+                        )
                     auth_result = git("ls-remote", "--exit-code", "--heads", GIT_REMOTE, BASE_BRANCH)
                     if command_check("GitHub authentication", auth_result, "read access confirmed"):
                         diagnostic = f"__coding-worker-doctor-{os.getpid()}"
