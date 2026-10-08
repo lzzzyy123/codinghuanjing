@@ -110,13 +110,13 @@ It then performs a normal, non-force push of only `agent/<RFC-ID>`. A failed fet
 ```yaml
 ---
 title: Implement the requested behavior
-test_command: "pytest -q"
+test_command: "pytest -q tests/relevant_module"
 lint_command: "ruff check ."
 build_command: ""
 ---
 ```
 
-At least one test/lint/build command is required. The following fields are rejected: `project`, `repository`, `working_directory`, `base_branch`, and `branch`. The body describes WHAT, WHY, boundaries, acceptance criteria, constraints, tests, and rollback. RFC commands are trusted operator input and run as `codingagent` in the isolated worktree.
+At least one test/lint/build command is required. These are module-level acceptance gates run before each review. A root-controlled `FULL_REGRESSION_COMMAND`, when configured, runs only after Reviewer PASS and before commit/push; RFC authors cannot override it. If the RFC test command is byte-identical to the full command, its passing result is reused. The following fields are rejected: `project`, `repository`, `working_directory`, `base_branch`, and `branch`. The body describes WHAT, WHY, boundaries, acceptance criteria, constraints, tests, and rollback. RFC commands are trusted operator input and run as `codingagent` in the isolated worktree.
 
 ## Daily Mac Flow
 

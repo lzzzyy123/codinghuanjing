@@ -51,6 +51,7 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 AGENT_TIMEOUT = int(os.environ.get("AGENT_TIMEOUT", "1800"))
 TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "1200"))
 GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "180"))
+FULL_REGRESSION_COMMAND = os.environ.get("FULL_REGRESSION_COMMAND", "").strip()
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "3"))
 MAX_CODER_CYCLES = int(os.environ.get("MAX_CODER_CYCLES", "5"))
 MAX_CONSECUTIVE_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_ERRORS", "3"))
@@ -502,6 +503,26 @@ def run_tests(metadata: dict[str, Any], cwd: Path, report_dir: Path) -> tuple[bo
     return all_passed, "\n\n".join(summaries)
 
 
+def run_full_regression(
+    metadata: dict[str, Any], cwd: Path, report_dir: Path
+) -> tuple[bool, str, str]:
+    """Run the root-controlled final gate after independent review passes."""
+    if not FULL_REGRESSION_COMMAND:
+        return True, "full regression: not configured (legacy command set)", "SKIPPED"
+    module_command = str(metadata.get("test_command", "")).strip()
+    if module_command == FULL_REGRESSION_COMMAND:
+        return True, "full regression: reused identical passing RFC test command", "REUSED"
+    result = run_test_command(
+        "full-regression", FULL_REGRESSION_COMMAND, cwd, report_dir
+    )
+    summary = (
+        f"full-regression: exit={result.returncode}, timed_out={result.timed_out}\n"
+        f"stdout:\n{safe_tail(result.stdout, 5000)}\n"
+        f"stderr:\n{safe_tail(result.stderr, 5000)}"
+    )
+    return result.ok, summary, "PASS" if result.ok else "FAIL"
+
+
 def json_object_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for start, character in enumerate(text):
@@ -866,6 +887,8 @@ def create_pr_description(
         for key in ("lint_command", "build_command", "test_command")
         if str(metadata.get(key, "")).strip()
     ]
+    if FULL_REGRESSION_COMMAND and FULL_REGRESSION_COMMAND not in commands:
+        commands.append(FULL_REGRESSION_COMMAND)
     test_lines = "\n".join(f"- PASS: `{command}`" for command in commands)
     description = f"""## RFC
 
@@ -920,6 +943,8 @@ def update_status(report_dir: Path, state: dict[str, Any], **changes: Any) -> No
         "status": state.get("status"),
         "phase": state.get("phase"),
         "tests_status": state.get("tests_status"),
+        "module_tests_status": state.get("module_tests_status"),
+        "full_regression_status": state.get("full_regression_status"),
         "review": state.get("review"),
         "push": state.get("push"),
         "changes": sorted(changes),
@@ -931,10 +956,12 @@ def update_status(report_dir: Path, state: dict[str, Any], **changes: Any) -> No
 
 
 def configured_commands(metadata: dict[str, Any]) -> dict[str, str]:
-    return {
+    commands = {
         key: str(metadata.get(key, "")).strip()
         for key in ("lint_command", "build_command", "test_command")
     }
+    commands["full_regression_command"] = FULL_REGRESSION_COMMAND
+    return commands
 
 
 def build_review_candidate(
@@ -1206,6 +1233,8 @@ def process_task(rfc_path: Path) -> None:
             "model": MODEL,
             "tests_passed": False,
             "tests_status": "PENDING",
+            "module_tests_status": "PENDING",
+            "full_regression_status": "PENDING" if FULL_REGRESSION_COMMAND else "SKIPPED",
             "review": None,
             "review_cycles": 0,
             "coder_cycles": 0,
@@ -1273,6 +1302,7 @@ def process_task(rfc_path: Path) -> None:
                 phase="reviewing_resume",
                 tests_passed=True,
                 tests_status="PASS",
+                module_tests_status="PASS",
                 validated_candidate=current_candidate,
                 review_cycles=review_cycles,
                 total_review_cycles=previous_total_reviews + review_cycles,
@@ -1296,26 +1326,54 @@ def process_task(rfc_path: Path) -> None:
                 review_format_repairs=repairs,
             )
             if review["verdict"] == "PASS":
-                complete_task(
-                    task_id,
-                    metadata,
-                    rfc_text,
-                    prior_answer,
-                    review,
-                    repo,
-                    worktree,
-                    base_ref,
-                    branch,
+                update_status(
                     report_dir,
                     status,
+                    phase="full_regression",
+                    full_regression_status="RUNNING",
                 )
-                return
-            feedback = review_feedback(review)
-            task_log(
-                report_dir,
-                f"Reviewer requested changes in resumed cycle {review_cycles}",
-                logging.WARNING,
-            )
+                regression_passed, regression_summary, regression_status = run_full_regression(
+                    metadata, worktree, report_dir
+                )
+                update_status(
+                    report_dir,
+                    status,
+                    tests_passed=regression_passed,
+                    tests_status="PASS" if regression_passed else "FAIL",
+                    full_regression_status=regression_status,
+                )
+                if regression_passed:
+                    complete_task(
+                        task_id,
+                        metadata,
+                        rfc_text,
+                        prior_answer,
+                        review,
+                        repo,
+                        worktree,
+                        base_ref,
+                        branch,
+                        report_dir,
+                        status,
+                    )
+                    return
+                feedback = (
+                    "The root-controlled full regression failed after review PASS. Fix only "
+                    "the demonstrated implementation defect, then rerun the necessary module "
+                    "tests and independent review.\n\n" + regression_summary
+                )
+                task_log(
+                    report_dir,
+                    "Full regression failed after resumed review",
+                    logging.WARNING,
+                )
+            else:
+                feedback = review_feedback(review)
+                task_log(
+                    report_dir,
+                    f"Reviewer requested changes in resumed cycle {review_cycles}",
+                    logging.WARNING,
+                )
         elif previous_status.get("status") == "review_infra_failed":
             task_log(
                 report_dir,
@@ -1367,6 +1425,7 @@ def process_task(rfc_path: Path) -> None:
             status,
             tests_passed=tests_passed,
             tests_status="PASS" if tests_passed else "FAIL",
+            module_tests_status="PASS" if tests_passed else "FAIL",
         )
         if not tests_passed:
             feedback = (
@@ -1414,20 +1473,44 @@ def process_task(rfc_path: Path) -> None:
         )
 
         if review["verdict"] == "PASS":
-            complete_task(
-                task_id,
-                metadata,
-                rfc_text,
-                answer,
-                review,
-                repo,
-                worktree,
-                base_ref,
-                branch,
+            update_status(
                 report_dir,
                 status,
+                phase="full_regression",
+                full_regression_status="RUNNING",
             )
-            return
+            regression_passed, regression_summary, regression_status = run_full_regression(
+                metadata, worktree, report_dir
+            )
+            update_status(
+                report_dir,
+                status,
+                tests_passed=regression_passed,
+                tests_status="PASS" if regression_passed else "FAIL",
+                full_regression_status=regression_status,
+            )
+            if regression_passed:
+                complete_task(
+                    task_id,
+                    metadata,
+                    rfc_text,
+                    answer,
+                    review,
+                    repo,
+                    worktree,
+                    base_ref,
+                    branch,
+                    report_dir,
+                    status,
+                )
+                return
+            feedback = (
+                "The root-controlled full regression failed after review PASS. Fix only the "
+                "demonstrated implementation defect, then rerun the necessary module tests "
+                "and independent review.\n\n" + regression_summary
+            )
+            task_log(report_dir, "Full regression failed after review PASS", logging.WARNING)
+            continue
 
         feedback = review_feedback(review)
         task_log(report_dir, f"Reviewer requested changes in cycle {review_cycles}", logging.WARNING)

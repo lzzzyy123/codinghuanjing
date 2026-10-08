@@ -1,6 +1,6 @@
 ---
 title: Short task title
-test_command: "pytest -q"
+test_command: "pytest -q tests/relevant_module"
 lint_command: ""
 build_command: ""
 ---
@@ -46,7 +46,7 @@ Compatibility, performance, security, style, or dependency constraints.
 
 ## Test Requirements
 
-Required cases and expected commands. The Worker executes the commands from YAML front matter independently in the RFC's isolated worktree.
+Required cases and expected commands. The Worker executes these module-level commands independently in the RFC's isolated worktree before every review. The root-controlled `FULL_REGRESSION_COMMAND` runs after Reviewer PASS and cannot be changed by an RFC.
 
 ## Rollback
 

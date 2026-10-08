@@ -38,6 +38,55 @@ def actionable_review(original_issue: str = "Fix the defect") -> str:
 
 
 class ReviewerPipelineTests(unittest.TestCase):
+    def test_full_regression_reuses_identical_module_command(self) -> None:
+        with mock.patch.object(watcher, "FULL_REGRESSION_COMMAND", "bun test"):
+            passed, summary, status = watcher.run_full_regression(
+                {"test_command": "bun test"}, Path("/unused"), Path("/unused")
+            )
+        self.assertTrue(passed)
+        self.assertEqual(status, "REUSED")
+        self.assertIn("reused", summary)
+
+    def test_full_regression_runs_root_controlled_command(self) -> None:
+        result = watcher.CommandResult("bun test", 0, "1123 pass", "")
+        with (
+            mock.patch.object(watcher, "FULL_REGRESSION_COMMAND", "bun test"),
+            mock.patch.object(watcher, "run_test_command", return_value=result) as run,
+        ):
+            passed, summary, status = watcher.run_full_regression(
+                {"test_command": "bun test tests/module.test.ts"},
+                Path("/worktree"),
+                Path("/reports/RFC"),
+            )
+        self.assertTrue(passed)
+        self.assertEqual(status, "PASS")
+        self.assertIn("1123 pass", summary)
+        run.assert_called_once_with(
+            "full-regression", "bun test", Path("/worktree"), Path("/reports/RFC")
+        )
+
+    def test_full_regression_failure_is_a_gate_failure(self) -> None:
+        result = watcher.CommandResult("bun test", 1, "", "failure")
+        with (
+            mock.patch.object(watcher, "FULL_REGRESSION_COMMAND", "bun test"),
+            mock.patch.object(watcher, "run_test_command", return_value=result),
+        ):
+            passed, summary, status = watcher.run_full_regression(
+                {"test_command": "bun test tests/module.test.ts"},
+                Path("/worktree"),
+                Path("/reports/RFC"),
+            )
+        self.assertFalse(passed)
+        self.assertEqual(status, "FAIL")
+        self.assertIn("failure", summary)
+
+    def test_review_candidate_records_root_controlled_regression_command(self) -> None:
+        with mock.patch.object(watcher, "FULL_REGRESSION_COMMAND", "bun test"):
+            commands = watcher.configured_commands(
+                {"lint_command": "bun run lint", "test_command": "bun test tests/module.ts"}
+            )
+        self.assertEqual(commands["full_regression_command"], "bun test")
+
     def test_tolerant_invariants_recover_invalid_regex_escapes(self) -> None:
         raw = json.dumps(review_object(issue="Regex must preserve marker"))
         raw = raw.replace("Regex must preserve marker", r"Regex /\s+\d+/ must preserve marker")

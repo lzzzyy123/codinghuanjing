@@ -61,6 +61,7 @@ MAX_CONSECUTIVE_ERRORS=3
 AGENT_TIMEOUT=1800
 TEST_TIMEOUT=1200
 GIT_TIMEOUT=180
+FULL_REGRESSION_COMMAND=
 POLL_INTERVAL=5
 KEEP_SUCCESS_WORKTREES=false
 ```
@@ -232,13 +233,14 @@ For a new RFC, the Worker must successfully:
 3. create exact branch `agent/<RFC-ID>` from `refs/remotes/origin/main`;
 4. create an isolated worktree;
 5. start a fresh Coder process and validate its standardized report;
-6. execute configured commands itself and log exit/stdout/stderr/timeout;
+6. execute RFC module commands itself and log exit/stdout/stderr/timeout;
 7. start a fresh independent Reviewer and validate structured JSON;
 8. return REQUEST_CHANGES to a fresh Coder within bounded cycles, or accept PASS;
-9. commit only after tests and review PASS;
-10. normally push only the exact task branch and verify remote SHA;
-11. generate compare URL and PR description;
-12. move `working -> done` and optionally remove the successful worktree.
+9. after review PASS, execute the root-controlled full regression gate (or reuse an identical passing RFC test command);
+10. commit only after module tests, review, and full regression PASS;
+11. normally push only the exact task branch and verify remote SHA;
+12. generate compare URL and PR description;
+13. move `working -> done` and optionally remove the successful worktree.
 
 Fetch/push/Agent/test/Git failures are bounded and become `failed` reports. The Worker never merges, deploys, force-pushes, or pushes the base branch.
 

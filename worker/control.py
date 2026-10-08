@@ -153,6 +153,10 @@ def rfc_status(task_id: str) -> None:
     if not tests_status:
         tests_status = "PASS" if state.get("tests_passed") else ("FAIL" if state.get("phase") in {"reviewing", "committing", "pushing", "complete", "failed"} else "PENDING")
     print(f"Tests: {tests_status}")
+    if state.get("module_tests_status"):
+        print(f"Module tests: {state['module_tests_status']}")
+    if state.get("full_regression_status"):
+        print(f"Full regression: {state['full_regression_status']}")
     print(f"Review: {state.get('review') or '-'}")
     print(f"Push: {state.get('push') or '-'}")
     print(f"PR: {state.get('pr_url') or 'not created'}")
