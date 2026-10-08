@@ -9,6 +9,7 @@ from typing import Any
 from .models import TaskState
 from .registry import Registry
 from .state_store import StateConflict, StateStore, utc_now
+from .leases import QueueStore
 
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -155,6 +156,23 @@ class DagScheduler:
             else:
                 blocked.append(f"{rfc_id}: {reason}")
         return {"ready": ready, "blocked": blocked}
+
+    def enqueue_ready(self, queue: QueueStore | None = None) -> list[int]:
+        """Materialize one idempotent initial Coder job for every Ready revision."""
+        queue = queue or QueueStore(self.store)
+        job_ids: list[int] = []
+        for task in self.store.list_tasks():
+            if task["state"] != TaskState.READY.value:
+                continue
+            revision = str(task["revision_digest"])
+            job_ids.append(
+                queue.enqueue(
+                    str(task["rfc_id"]),
+                    "coding",
+                    f"coding:{task['rfc_id']}:{revision}",
+                )
+            )
+        return job_ids
 
     def readiness_blockers(self) -> list[str]:
         with self.store.connect() as connection:

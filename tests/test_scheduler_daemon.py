@@ -56,7 +56,16 @@ class DaemonTests(unittest.TestCase):
             result = daemon.reconcile()
             self.assertEqual(result["ready"], ["RFC-20261008-056"])
             with StateStore(database).connect() as connection:
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+                jobs = connection.execute(
+                    "SELECT kind, state, revision_digest FROM jobs"
+                ).fetchall()
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual((jobs[0]["kind"], jobs[0]["state"]), ("coding", "queued"))
+
+            second = daemon.reconcile()
+            self.assertEqual(second["enqueued_jobs"], result["enqueued_jobs"])
+            with StateStore(database).connect() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
 
     def test_non_shadow_mode_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "production cutover"):

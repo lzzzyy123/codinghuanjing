@@ -57,10 +57,12 @@ class SchedulerDaemon:
         validated = scheduler.validate_tasks()
         recovered = QueueStore(store).recover_expired()
         readiness = scheduler.refresh_ready()
+        enqueued = scheduler.enqueue_ready()
         return {
             "registry": registry.digest,
             "validated": validated,
             "recovered_jobs": recovered,
+            "enqueued_jobs": enqueued,
             **readiness,
         }
 
@@ -68,12 +70,13 @@ class SchedulerDaemon:
         while not self.stop_event.is_set():
             result = self.reconcile()
             LOG.info(
-                "shadow reconcile registry=%s validated=%d ready=%d blocked=%d recovered=%d",
+                "shadow reconcile registry=%s validated=%d ready=%d blocked=%d recovered=%d enqueued=%d",
                 result["registry"],
                 len(result["validated"]),
                 len(result["ready"]),
                 len(result["blocked"]),
                 len(result["recovered_jobs"]),
+                len(result["enqueued_jobs"]),
             )
             if once:
                 return
