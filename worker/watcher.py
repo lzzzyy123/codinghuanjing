@@ -933,6 +933,11 @@ def process_task(rfc_path: Path) -> None:
             )
             task_log(report_dir, f"Completed and pushed {branch} at {commit_sha}")
             if not KEEP_SUCCESS_WORKTREES:
+                # Bun and other build tools may create ignored directories with
+                # owner-only write bits. Restore the shared-group permissions so
+                # codingworker can remove the complete worktree after the Agent
+                # and tests have finished.
+                prepare_agent_worktree(worktree)
                 git(repo, "worktree", "remove", "--force", str(worktree))
                 git(repo, "worktree", "prune")
                 update_status(report_dir, status, worktree_removed=True)
