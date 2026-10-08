@@ -25,7 +25,7 @@ Your entire final response must be one JSON object with this schema and no Markd
   "architecture_scope_review": "architectural fit and scope assessment",
   "security_review": "security assessment",
   "regression_risks": ["remaining non-blocking risk"],
-  "required_changes": ["specific actionable issue"]
+  "required_changes": ["Issue: exact blocking defect | Location: path:line or precise symbol | Reproduction: exact command/test/input | Acceptance: observable condition that proves the defect is fixed"]
 }
 
-For `PASS`, `required_changes` must be empty. For `REQUEST_CHANGES`, it must contain at least one specific actionable item. Every acceptance criterion must have a separate PASS or FAIL entry with concrete evidence. Even for PASS, fill every review field substantively.
+For `PASS`, `required_changes` must be empty. For `REQUEST_CHANGES`, every item must use all four markers shown above and must be independently actionable. Every acceptance criterion must have a separate PASS or FAIL entry with concrete evidence. Even for PASS, fill every review field substantively.

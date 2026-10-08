@@ -24,7 +24,7 @@ import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 
@@ -54,6 +54,7 @@ GIT_TIMEOUT = int(os.environ.get("GIT_TIMEOUT", "180"))
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "3"))
 MAX_CODER_CYCLES = int(os.environ.get("MAX_CODER_CYCLES", "5"))
 MAX_CONSECUTIVE_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_ERRORS", "3"))
+MAX_REVIEW_FORMAT_REPAIRS = int(os.environ.get("MAX_REVIEW_FORMAT_REPAIRS", "2"))
 MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "1"))
 KEEP_SUCCESS_WORKTREES = os.environ.get("KEEP_SUCCESS_WORKTREES", "false").lower() == "true"
 
@@ -78,6 +79,14 @@ class TaskFailure(RuntimeError):
 
 
 class AgentFailure(TaskFailure):
+    pass
+
+
+class ReviewFormatError(AgentFailure):
+    pass
+
+
+class ReviewInfrastructureFailure(TaskFailure):
     pass
 
 
@@ -120,6 +129,36 @@ def task_log(report_dir: Path, message: str, level: int = logging.INFO) -> None:
 
 def safe_tail(value: str, limit: int = 12000) -> str:
     return value if len(value) <= limit else "[truncated]\n" + value[-limit:]
+
+
+SENSITIVE_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "LITELLM_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+)
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Remove known credentials and common inline secret assignments from evidence."""
+    redacted = value
+    for name in SENSITIVE_ENV_NAMES:
+        secret = os.environ.get(name, "")
+        if len(secret) >= 4:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|(?:api[_-]?key|auth[_-]?token|password)\s*[:=]\s*)"
+        r"([^\s,}\]]+)",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
+def write_redacted(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(redact_sensitive_text(value), encoding="utf-8")
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -367,10 +406,9 @@ def run_agent_once(role: str, prompt: str, cwd: Path, report_dir: Path, label: s
     task_log(report_dir, f"Starting independent {role} process ({label})")
     result = execute(command, cwd, AGENT_TIMEOUT, input_text=prompt, env=env)
     raw_path = report_dir / "raw" / f"{label}.json"
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_path.write_text(result.stdout, encoding="utf-8")
+    write_redacted(raw_path, result.stdout)
     if result.stderr:
-        (report_dir / "raw" / f"{label}.stderr.log").write_text(result.stderr, encoding="utf-8")
+        write_redacted(report_dir / "raw" / f"{label}.stderr.log", result.stderr)
     if not result.ok:
         reason = "timed out" if result.timed_out else f"exited {result.returncode}"
         raise AgentFailure(f"{role} {reason}: {safe_tail(result.stderr or result.stdout)}")
@@ -383,7 +421,7 @@ def run_agent_once(role: str, prompt: str, cwd: Path, report_dir: Path, label: s
     answer = envelope.get("result")
     if not isinstance(answer, str) or not answer.strip():
         raise AgentFailure(f"{role} returned no final result")
-    return answer.strip()
+    return redact_sensitive_text(answer.strip())
 
 
 def run_agent(role: str, prompt: str, cwd: Path, report_dir: Path, label: str) -> str:
@@ -464,32 +502,111 @@ def run_tests(metadata: dict[str, Any], cwd: Path, report_dir: Path) -> tuple[bo
     return all_passed, "\n\n".join(summaries)
 
 
-def extract_json_object(text: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
+def json_object_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    for start, character in enumerate(text):
         if character != "{":
             continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            current = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start : index + 1])
+                    break
+                if depth < 0:
+                    break
+    return candidates
+
+
+def escape_invalid_json_string_escapes(candidate: str) -> str:
+    """Repair only invalid JSON string escapes, preserving all other bytes."""
+    output: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(candidate):
+        character = candidate[index]
+        if character == '"':
+            in_string = not in_string
+            output.append(character)
+            index += 1
+            continue
+        if in_string and character == "\\" and index + 1 < len(candidate):
+            escaped = candidate[index + 1]
+            if escaped in '"\\/bfnrt':
+                output.extend((character, escaped))
+                index += 2
+                continue
+            if escaped == "u" and re.fullmatch(r"[0-9A-Fa-f]{4}", candidate[index + 2 : index + 6]):
+                output.append(candidate[index : index + 6])
+                index += 6
+                continue
+            output.extend(("\\", "\\", escaped))
+            index += 2
+            continue
+        output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def decode_review_object(text: str, *, tolerate_invalid_escapes: bool = False) -> dict[str, Any]:
+    errors: list[str] = []
+    for candidate in json_object_candidates(text):
+        value_text = (
+            escape_invalid_json_string_escapes(candidate)
+            if tolerate_invalid_escapes
+            else candidate
+        )
         try:
-            value, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
+            value = json.loads(value_text)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {exc.lineno} column {exc.colno}: {exc.msg}")
             continue
         if isinstance(value, dict) and "verdict" in value:
             return value
-    raise AgentFailure("Reviewer result did not contain a JSON object with verdict")
+    detail = errors[-1] if errors else "no balanced JSON object containing verdict"
+    raise ReviewFormatError(f"Reviewer JSON could not be decoded: {detail}")
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    return decode_review_object(text)
 
 
 def validate_review(text: str) -> dict[str, Any]:
     review = extract_json_object(text)
     verdict = review.get("verdict")
     if verdict not in {"PASS", "REQUEST_CHANGES"}:
-        raise AgentFailure("Reviewer verdict must be PASS or REQUEST_CHANGES")
+        raise ReviewFormatError("Reviewer verdict must be PASS or REQUEST_CHANGES")
     issues = review.get("required_changes", review.get("issues"))
     if not isinstance(issues, list) or not all(isinstance(issue, str) for issue in issues):
-        raise AgentFailure("Reviewer required_changes must be an array of strings")
+        raise ReviewFormatError("Reviewer required_changes must be an array of strings")
     if verdict == "REQUEST_CHANGES" and not issues:
-        raise AgentFailure("REQUEST_CHANGES must include at least one issue")
+        raise ReviewFormatError("REQUEST_CHANGES must include at least one issue")
     if verdict == "PASS" and issues:
-        raise AgentFailure("PASS must use an empty required_changes array")
+        raise ReviewFormatError("PASS must use an empty required_changes array")
+    if verdict == "REQUEST_CHANGES":
+        required_markers = ("Issue:", "Location:", "Reproduction:", "Acceptance:")
+        for issue in issues:
+            missing = [marker for marker in required_markers if marker.casefold() not in issue.casefold()]
+            if missing:
+                raise ReviewFormatError(
+                    "Each required change must include Issue, Location, Reproduction, and Acceptance markers"
+                )
     review["required_changes"] = issues
     for key in (
         "summary",
@@ -498,13 +615,159 @@ def validate_review(text: str) -> dict[str, Any]:
         "security_review",
     ):
         if not isinstance(review.get(key), str) or not review[key].strip():
-            raise AgentFailure(f"Reviewer {key} must be a non-empty string")
+            raise ReviewFormatError(f"Reviewer {key} must be a non-empty string")
     for key in ("acceptance_criteria", "code_review_findings", "regression_risks"):
         if not isinstance(review.get(key), list) or not all(
             isinstance(item, str) for item in review[key]
         ):
-            raise AgentFailure(f"Reviewer {key} must be an array of strings")
+            raise ReviewFormatError(f"Reviewer {key} must be an array of strings")
     return review
+
+
+def normalize_review_text(value: str) -> str:
+    controls = {"\b": r"\b", "\f": r"\f", "\n": r"\n", "\r": r"\r", "\t": r"\t"}
+    normalized = "".join(controls.get(character, character) for character in value)
+    return " ".join(normalized.split()).casefold()
+
+
+def review_invariants(text: str) -> dict[str, Any]:
+    review = decode_review_object(text, tolerate_invalid_escapes=True)
+    verdict = review.get("verdict")
+    issues = review.get("required_changes", review.get("issues"))
+    if verdict not in {"PASS", "REQUEST_CHANGES"}:
+        raise ReviewFormatError("Cannot safely repair review without a valid original verdict")
+    if not isinstance(issues, list) or not all(isinstance(issue, str) for issue in issues):
+        raise ReviewFormatError("Cannot safely repair review without its original required changes")
+    if verdict == "PASS" and issues:
+        raise ReviewFormatError("Original PASS review contains required changes")
+    if verdict == "REQUEST_CHANGES" and not issues:
+        raise ReviewFormatError("Original REQUEST_CHANGES review contains no issue")
+    review["required_changes"] = issues
+    return review
+
+
+def review_preserves_invariants(original: dict[str, Any], repaired: dict[str, Any]) -> bool:
+    if repaired.get("verdict") != original.get("verdict"):
+        return False
+    original_issues = original.get("required_changes", [])
+    repaired_issues = repaired.get("required_changes", [])
+    if len(original_issues) != len(repaired_issues):
+        return False
+    for source, destination in zip(original_issues, repaired_issues):
+        if normalize_review_text(source) not in normalize_review_text(destination):
+            return False
+    for key in ("acceptance_criteria", "code_review_findings", "regression_risks"):
+        source_items = original.get(key)
+        destination_items = repaired.get(key)
+        if not isinstance(source_items, list) or not all(isinstance(item, str) for item in source_items):
+            continue
+        if not isinstance(destination_items, list) or len(source_items) > len(destination_items):
+            return False
+        normalized_destination = [normalize_review_text(item) for item in destination_items]
+        if any(
+            not any(normalize_review_text(item) in candidate for candidate in normalized_destination)
+            for item in source_items
+        ):
+            return False
+    for key in ("summary", "test_review", "architecture_scope_review", "security_review"):
+        source = original.get(key)
+        destination = repaired.get(key)
+        if isinstance(source, str) and (
+            not isinstance(destination, str)
+            or normalize_review_text(source) != normalize_review_text(destination)
+        ):
+            return False
+    return True
+
+
+def review_format_repair_prompt(
+    original: dict[str, Any], parse_error: str, repair_attempt: int
+) -> str:
+    canonical = json.dumps(original, ensure_ascii=True, indent=2)
+    return f"""# Role: Reviewer Output Formatter
+
+You are formatting an already completed independent review. Do not inspect or modify code.
+Do not change the verdict, summary, findings, acceptance assessments, risks, or issue count.
+Do not remove, combine, soften, or invent required changes. Never turn REQUEST_CHANGES into PASS.
+
+The previous serialization error was: {parse_error}
+Format repair attempt: {repair_attempt}/{MAX_REVIEW_FORMAT_REPAIRS}
+
+Return exactly one JSON object with the Reviewer schema and no Markdown fence or preamble.
+For every REQUEST_CHANGES item, preserve the original issue text verbatim inside `Issue:` and append
+`Location:`, `Reproduction:`, and `Acceptance:` fields grounded only in that same original issue.
+
+Canonical original review object:
+{canonical}
+"""
+
+
+def validate_review_with_repairs(
+    review_text: str,
+    report_dir: Path,
+    artifact_stem: str,
+    repair: Callable[[str, int], str],
+) -> tuple[dict[str, Any], int]:
+    current = redact_sensitive_text(review_text)
+    write_redacted(report_dir / f"review-raw-{artifact_stem}-format-0.txt", current)
+    diagnostics: list[dict[str, Any]] = []
+    try:
+        original = review_invariants(current)
+    except ReviewFormatError as exc:
+        diagnostics.append({"format_attempt": 0, "error": str(exc), "repair_safe": False})
+        atomic_json(report_dir / f"review-format-diagnostics-{artifact_stem}.json", {"attempts": diagnostics})
+        raise ReviewInfrastructureFailure(
+            "REVIEW_INFRA_FAILED: original verdict/issues could not be recovered without invention"
+        ) from exc
+
+    last_error = "unknown review format error"
+    for format_attempt in range(0, MAX_REVIEW_FORMAT_REPAIRS + 1):
+        try:
+            review = validate_review(current)
+            if not review_preserves_invariants(original, review):
+                raise ReviewFormatError(
+                    "Formatted review changed the original verdict, findings, or required changes"
+                )
+            diagnostics.append(
+                {
+                    "format_attempt": format_attempt,
+                    "result": "PASS",
+                    "sha256": hashlib.sha256(current.encode("utf-8")).hexdigest(),
+                }
+            )
+            atomic_json(
+                report_dir / f"review-format-diagnostics-{artifact_stem}.json",
+                {"attempts": diagnostics},
+            )
+            return review, format_attempt
+        except ReviewFormatError as exc:
+            last_error = str(exc)
+            diagnostics.append(
+                {
+                    "format_attempt": format_attempt,
+                    "result": "INVALID",
+                    "error": last_error,
+                    "sha256": hashlib.sha256(current.encode("utf-8")).hexdigest(),
+                }
+            )
+        if format_attempt >= MAX_REVIEW_FORMAT_REPAIRS:
+            break
+        current = redact_sensitive_text(
+            repair(review_format_repair_prompt(original, last_error, format_attempt + 1), format_attempt + 1)
+        )
+        write_redacted(
+            report_dir / f"review-raw-{artifact_stem}-format-{format_attempt + 1}.txt",
+            current,
+        )
+
+    atomic_json(
+        report_dir / f"review-format-diagnostics-{artifact_stem}.json",
+        {"attempts": diagnostics},
+    )
+    raise ReviewInfrastructureFailure(
+        f"REVIEW_INFRA_FAILED: no schema-valid, invariant-preserving review after "
+        f"{MAX_REVIEW_FORMAT_REPAIRS} format repairs: {last_error}"
+    )
 
 
 CODER_REPORT_HEADINGS = (
@@ -651,6 +914,45 @@ def update_status(report_dir: Path, state: dict[str, Any], **changes: Any) -> No
     atomic_json(report_dir / "status.json", state)
 
 
+def configured_commands(metadata: dict[str, Any]) -> dict[str, str]:
+    return {
+        key: str(metadata.get(key, "")).strip()
+        for key in ("lint_command", "build_command", "test_command")
+    }
+
+
+def build_review_candidate(
+    rfc_text: str,
+    metadata: dict[str, Any],
+    base_commit: str,
+    worktree: Path,
+    base_ref: str,
+    coder_report: str,
+) -> dict[str, Any]:
+    return {
+        "rfc_sha256": hashlib.sha256(rfc_text.encode("utf-8")).hexdigest(),
+        "commands": configured_commands(metadata),
+        "base_commit": base_commit,
+        "workspace_fingerprint": workspace_fingerprint(worktree, base_ref),
+        "coder_report_sha256": hashlib.sha256(coder_report.encode("utf-8")).hexdigest(),
+    }
+
+
+def review_candidate_is_reusable(
+    previous_status: dict[str, Any],
+    candidate: dict[str, Any],
+    coder_report: str,
+) -> bool:
+    if previous_status.get("status") != "review_infra_failed":
+        return False
+    if previous_status.get("tests_status") != "PASS" or not previous_status.get("tests_passed"):
+        return False
+    if coder_report_errors(coder_report):
+        return False
+    previous_candidate = previous_status.get("validated_candidate")
+    return isinstance(previous_candidate, dict) and previous_candidate == candidate
+
+
 def coder_prompt(
     rfc_text: str,
     task_id: str,
@@ -688,6 +990,51 @@ def reviewer_prompt(
         + f"Independent test log: {report_dir / 'tests.log'}\n"
         + f"\n# RFC\n{rfc_text}\n"
     )
+
+
+def perform_review(
+    rfc_text: str,
+    task_id: str,
+    worktree: Path,
+    base_ref: str,
+    branch: str,
+    report_dir: Path,
+    attempt: int,
+    cycle: int,
+) -> tuple[dict[str, Any], int]:
+    before = workspace_fingerprint(worktree, base_ref)
+    review_text = run_agent(
+        "Reviewer",
+        reviewer_prompt(rfc_text, task_id, worktree, base_ref, branch, report_dir, cycle),
+        worktree,
+        report_dir,
+        f"attempt-{attempt}-reviewer-{cycle}",
+    )
+
+    def repair(prompt: str, format_attempt: int) -> str:
+        return run_agent(
+            "ReviewerFormatter",
+            prompt,
+            worktree,
+            report_dir,
+            f"attempt-{attempt}-reviewer-{cycle}-format-{format_attempt}",
+        )
+
+    artifact_stem = f"attempt-{attempt}-cycle-{cycle}"
+    review, repairs = validate_review_with_repairs(
+        review_text, report_dir, artifact_stem, repair
+    )
+    after = workspace_fingerprint(worktree, base_ref)
+    if before != after:
+        raise TaskFailure("Reviewer or format repair modified the task worktree; review aborted")
+    human_review = render_review_report(review, task_id, attempt, cycle)
+    (report_dir / f"review-attempt-{attempt}-cycle-{cycle}.md").write_text(
+        human_review, encoding="utf-8"
+    )
+    (report_dir / "review-report.md").write_text(human_review, encoding="utf-8")
+    atomic_json(report_dir / f"review-attempt-{attempt}-cycle-{cycle}.json", review)
+    atomic_json(report_dir / "review-latest.json", review)
+    return review, repairs
 
 
 def commit_result(task_id: str, title: str, worktree: Path, base_ref: str, report_dir: Path) -> str:
@@ -744,6 +1091,62 @@ def push_result(
     return remote_url, compare_url
 
 
+def review_feedback(review: dict[str, Any]) -> str:
+    return "Independent review requested these changes:\n" + "\n".join(
+        f"{index}. {issue}"
+        for index, issue in enumerate(review["required_changes"], start=1)
+    )
+
+
+def complete_task(
+    task_id: str,
+    metadata: dict[str, Any],
+    rfc_text: str,
+    answer: str,
+    review: dict[str, Any],
+    repo: Path,
+    worktree: Path,
+    base_ref: str,
+    branch: str,
+    report_dir: Path,
+    status: dict[str, Any],
+) -> None:
+    update_status(report_dir, status, phase="committing")
+    commit_sha = commit_result(
+        task_id, str(metadata.get("title", "")).strip(), worktree, base_ref, report_dir
+    )
+    update_status(report_dir, status, phase="pushing", commit_sha=commit_sha)
+    remote_url, compare_url = push_result(repo, task_id, branch, commit_sha)
+    create_pr_description(task_id, rfc_text, metadata, answer, review, commit_sha, report_dir)
+    prior_pr_url = status.get("pr_url")
+    prior_pr_status = status.get("pr_status")
+    status.pop("pending_amendment", None)
+    update_status(
+        report_dir,
+        status,
+        status="done",
+        phase="complete",
+        commit_sha=commit_sha,
+        tests_passed=True,
+        tests_status="PASS",
+        review="PASS",
+        push="PASS",
+        remote_url=remote_url,
+        compare_url=compare_url,
+        pr_status=prior_pr_status if prior_pr_url else "not_created",
+        pr_url=prior_pr_url,
+        completed_at=utc_now(),
+    )
+    task_log(report_dir, f"Completed and pushed {branch} at {commit_sha}")
+    if not KEEP_SUCCESS_WORKTREES:
+        # Build tools can leave owner-only ignored directories. Restore the
+        # shared-group permissions before codingworker removes the worktree.
+        prepare_agent_worktree(worktree)
+        git(repo, "worktree", "remove", "--force", str(worktree))
+        git(repo, "worktree", "prune")
+        update_status(report_dir, status, worktree_removed=True)
+
+
 def process_task(rfc_path: Path) -> None:
     task_id = rfc_path.stem
     report_dir = REPORTS / task_id
@@ -760,6 +1163,7 @@ def process_task(rfc_path: Path) -> None:
             status = {}
     else:
         status = {}
+    previous_status = dict(status)
     previous_total_reviews = int(status.get("total_review_cycles", status.get("review_cycles", 0)) or 0)
     previous_total_coder = int(status.get("total_coder_cycles", status.get("coder_cycles", 0)) or 0)
     attempt = int(status.get("attempts", 0) or 0) + 1
@@ -777,6 +1181,7 @@ def process_task(rfc_path: Path) -> None:
         status["failure_history"] = history
     status.pop("failure", None)
     status.pop("failed_at", None)
+    status.pop("failure_kind", None)
     status.update(
         {
             "rfc": task_id,
@@ -811,14 +1216,97 @@ def process_task(rfc_path: Path) -> None:
             "base_branch": base_branch,
             "base_commit": base_commit,
             "git_remote": GIT_REMOTE,
-            "pr_status": "not_created",
-            "pr_url": None,
+            "pr_status": previous_status.get("pr_status", "not_created"),
+            "pr_url": previous_status.get("pr_url"),
         }
     )
+    amendment = previous_status.get("pending_amendment")
+    amendment_text = ""
+    if isinstance(amendment, dict):
+        amendment_path = report_dir / "amendments" / str(amendment.get("file", ""))
+        try:
+            amendment_path.resolve().relative_to((report_dir / "amendments").resolve())
+        except ValueError as exc:
+            raise TaskFailure("Pending amendment path escaped its report directory") from exc
+        if not amendment_path.is_file():
+            raise TaskFailure("Pending amendment report is missing")
+        amendment_text = amendment_path.read_text(encoding="utf-8")
+    effective_rfc_text = rfc_text
+    if amendment_text:
+        effective_rfc_text += "\n\n# Project Lead Amendment\n\n" + amendment_text
     update_status(report_dir, status, phase="coding")
 
-    feedback = ""
+    feedback = amendment_text
     review_cycles = 0
+    coder_report_path = report_dir / "coder-report.md"
+    if coder_report_path.is_file():
+        prior_answer = coder_report_path.read_text(encoding="utf-8").strip()
+        current_candidate = build_review_candidate(
+            effective_rfc_text,
+            metadata,
+            base_commit,
+            worktree,
+            base_ref,
+            prior_answer,
+        )
+        if review_candidate_is_reusable(previous_status, current_candidate, prior_answer):
+            review_cycles = 1
+            update_status(
+                report_dir,
+                status,
+                phase="reviewing_resume",
+                tests_passed=True,
+                tests_status="PASS",
+                validated_candidate=current_candidate,
+                review_cycles=review_cycles,
+                total_review_cycles=previous_total_reviews + review_cycles,
+                reviewer_resume=True,
+            )
+            task_log(report_dir, "Reusing unchanged tested candidate; resuming independent Reviewer")
+            review, repairs = perform_review(
+                effective_rfc_text,
+                task_id,
+                worktree,
+                base_ref,
+                branch,
+                report_dir,
+                attempt,
+                review_cycles,
+            )
+            update_status(
+                report_dir,
+                status,
+                review=review["verdict"],
+                review_format_repairs=repairs,
+            )
+            if review["verdict"] == "PASS":
+                complete_task(
+                    task_id,
+                    metadata,
+                    rfc_text,
+                    prior_answer,
+                    review,
+                    repo,
+                    worktree,
+                    base_ref,
+                    branch,
+                    report_dir,
+                    status,
+                )
+                return
+            feedback = review_feedback(review)
+            task_log(
+                report_dir,
+                f"Reviewer requested changes in resumed cycle {review_cycles}",
+                logging.WARNING,
+            )
+        elif previous_status.get("status") == "review_infra_failed":
+            task_log(
+                report_dir,
+                "Stored review candidate changed; Coder and tests must run again",
+                logging.WARNING,
+            )
+
     for coder_cycle in range(1, MAX_CODER_CYCLES + 1):
         update_status(
             report_dir,
@@ -830,7 +1318,7 @@ def process_task(rfc_path: Path) -> None:
         )
         answer = run_agent(
             "Coder",
-            coder_prompt(rfc_text, task_id, worktree, branch, feedback, coder_cycle),
+            coder_prompt(effective_rfc_text, task_id, worktree, branch, feedback, coder_cycle),
             worktree,
             report_dir,
             f"attempt-{attempt}-coder-{coder_cycle}",
@@ -872,6 +1360,16 @@ def process_task(rfc_path: Path) -> None:
             task_log(report_dir, f"Tests failed after coder cycle {coder_cycle}", logging.WARNING)
             continue
 
+        candidate = build_review_candidate(
+            effective_rfc_text,
+            metadata,
+            base_commit,
+            worktree,
+            base_ref,
+            answer,
+        )
+        update_status(report_dir, status, validated_candidate=candidate)
+
         if review_cycles >= MAX_REVIEW_CYCLES:
             raise TaskFailure(f"Exceeded maximum review cycles ({MAX_REVIEW_CYCLES})")
         review_cycles += 1
@@ -882,71 +1380,40 @@ def process_task(rfc_path: Path) -> None:
             review_cycles=review_cycles,
             total_review_cycles=previous_total_reviews + review_cycles,
         )
-        before = workspace_fingerprint(worktree, base_ref)
-        review_text = run_agent(
-            "Reviewer",
-            reviewer_prompt(
-                rfc_text, task_id, worktree, base_ref, branch, report_dir, review_cycles
-            ),
+        review, repairs = perform_review(
+            effective_rfc_text,
+            task_id,
             worktree,
+            base_ref,
+            branch,
             report_dir,
-            f"attempt-{attempt}-reviewer-{review_cycles}",
+            attempt,
+            review_cycles,
         )
-        after = workspace_fingerprint(worktree, base_ref)
-        if before != after:
-            raise TaskFailure("Reviewer modified the task worktree; review aborted")
-        review = validate_review(review_text)
-        human_review = render_review_report(review, task_id, attempt, review_cycles)
-        (report_dir / f"review-attempt-{attempt}-cycle-{review_cycles}.md").write_text(
-            human_review, encoding="utf-8"
+        update_status(
+            report_dir,
+            status,
+            review=review["verdict"],
+            review_format_repairs=repairs,
         )
-        (report_dir / "review-report.md").write_text(human_review, encoding="utf-8")
-        atomic_json(report_dir / f"review-attempt-{attempt}-cycle-{review_cycles}.json", review)
-        atomic_json(report_dir / "review-latest.json", review)
-        update_status(report_dir, status, review=review["verdict"])
 
         if review["verdict"] == "PASS":
-            update_status(report_dir, status, phase="committing")
-            commit_sha = commit_result(
-                task_id, str(metadata.get("title", "")).strip(), worktree, base_ref, report_dir
-            )
-            update_status(report_dir, status, phase="pushing", commit_sha=commit_sha)
-            remote_url, compare_url = push_result(repo, task_id, branch, commit_sha)
-            create_pr_description(
-                task_id, rfc_text, metadata, answer, review, commit_sha, report_dir
-            )
-            update_status(
+            complete_task(
+                task_id,
+                metadata,
+                rfc_text,
+                answer,
+                review,
+                repo,
+                worktree,
+                base_ref,
+                branch,
                 report_dir,
                 status,
-                status="done",
-                phase="complete",
-                commit_sha=commit_sha,
-                tests_passed=True,
-                tests_status="PASS",
-                review="PASS",
-                push="PASS",
-                remote_url=remote_url,
-                compare_url=compare_url,
-                pr_status="not_created",
-                pr_url=None,
-                completed_at=utc_now(),
             )
-            task_log(report_dir, f"Completed and pushed {branch} at {commit_sha}")
-            if not KEEP_SUCCESS_WORKTREES:
-                # Bun and other build tools may create ignored directories with
-                # owner-only write bits. Restore the shared-group permissions so
-                # codingworker can remove the complete worktree after the Agent
-                # and tests have finished.
-                prepare_agent_worktree(worktree)
-                git(repo, "worktree", "remove", "--force", str(worktree))
-                git(repo, "worktree", "prune")
-                update_status(report_dir, status, worktree_removed=True)
             return
 
-        feedback = "Independent review requested these changes:\n" + "\n".join(
-            f"{index}. {issue}"
-            for index, issue in enumerate(review["required_changes"], start=1)
-        )
+        feedback = review_feedback(review)
         task_log(report_dir, f"Reviewer requested changes in cycle {review_cycles}", logging.WARNING)
 
     raise TaskFailure(f"Exceeded maximum coder cycles ({MAX_CODER_CYCLES})")
@@ -965,6 +1432,33 @@ def handle_claimed(rfc_path: Path) -> None:
     report_dir = REPORTS / task_id
     try:
         process_task(rfc_path)
+    except ReviewInfrastructureFailure as exc:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        reason = str(exc)
+        task_log(report_dir, reason, logging.ERROR)
+        append_text(
+            report_dir / "failure-report.md",
+            f"# Review Infrastructure Failure\n\n{utc_now()}\n\n{reason}\n",
+        )
+        status_path = report_dir / "status.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            status = {}
+        status.update(
+            {
+                "rfc": task_id,
+                "status": "review_infra_failed",
+                "phase": "review_infra_failed",
+                "failure_kind": "REVIEW_INFRA_FAILED",
+                "failure": reason,
+            }
+        )
+        update_status(report_dir, status, failed_at=utc_now())
+        LOG.debug("Task traceback:\n%s", traceback.format_exc())
+        if rfc_path.exists():
+            os.replace(rfc_path, final_destination(FAILED, rfc_path))
+        return
     except Exception as exc:
         report_dir.mkdir(parents=True, exist_ok=True)
         reason = f"{type(exc).__name__}: {exc}"
@@ -1051,6 +1545,8 @@ def validate_runtime() -> None:
         raise RuntimeError("This worker version requires MAX_CONCURRENT_TASKS=1")
     if MAX_REVIEW_CYCLES < 1 or MAX_CODER_CYCLES < 1 or MAX_CONSECUTIVE_ERRORS < 1:
         raise RuntimeError("Cycle and error limits must be positive")
+    if MAX_REVIEW_FORMAT_REPAIRS < 0 or MAX_REVIEW_FORMAT_REPAIRS > 2:
+        raise RuntimeError("MAX_REVIEW_FORMAT_REPAIRS must be between 0 and 2")
     if os.geteuid() != 0:
         raise RuntimeError("Worker orchestrator must run as root and drop privileges for every child")
     if not Path(AGENT_CLI).is_file():
