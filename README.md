@@ -154,6 +154,8 @@ The container retains full execution evidence. The GitHub PR is the durable repo
 
 For a Project Lead defect found before merge, `tools/amend-rfc.sh RFC-ID REPORT.md` queues a bounded correction cycle on the same RFC branch and preserves the existing PR URL and all prior evidence. Merged RFCs cannot be amended, and amendments cannot change scope.
 
+The current deployment remains single-Worker. [docs/MULTI_WORKER_EXPANSION.md](docs/MULTI_WORKER_EXPANSION.md) defines the ownership, dependency, isolation, and integration gates required before an operator-approved 2-4 Worker rollout.
+
 ## Operations
 
 ```bash
