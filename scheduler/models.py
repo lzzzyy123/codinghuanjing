@@ -30,7 +30,7 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.VALIDATED: {TaskState.READY, TaskState.BLOCKED},
     TaskState.READY: {TaskState.LEASED, TaskState.BLOCKED},
     TaskState.LEASED: {TaskState.CODING, TaskState.READY, TaskState.BLOCKED},
-    TaskState.CODING: {TaskState.TESTING, TaskState.BLOCKED},
+    TaskState.CODING: {TaskState.READY, TaskState.TESTING, TaskState.BLOCKED},
     TaskState.TESTING: {TaskState.REVIEWING, TaskState.AMENDMENT, TaskState.BLOCKED},
     TaskState.REVIEWING: {
         TaskState.LEAD_REVIEW,

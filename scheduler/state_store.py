@@ -62,6 +62,61 @@ CREATE TABLE IF NOT EXISTS transitions (
     metadata_json TEXT NOT NULL,
     UNIQUE(rfc_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS merge_records (
+    rfc_id TEXT PRIMARY KEY REFERENCES tasks(rfc_id),
+    revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    merge_commit TEXT NOT NULL,
+    contracts_json TEXT NOT NULL,
+    recorded_by TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    model TEXT NOT NULL,
+    process_identity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    capacity INTEGER NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    metrics_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    rfc_id TEXT NOT NULL REFERENCES tasks(rfc_id),
+    revision_digest TEXT NOT NULL REFERENCES rfc_revisions(revision_digest),
+    kind TEXT NOT NULL,
+    role TEXT NOT NULL,
+    state TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    candidate_digest TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL,
+    available_at REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS jobs_claim_idx
+    ON jobs(role, state, available_at, priority DESC, job_id);
+CREATE TABLE IF NOT EXISTS resource_fences (
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    last_token INTEGER NOT NULL,
+    PRIMARY KEY(resource_type, resource_id)
+);
+CREATE TABLE IF NOT EXISTS leases (
+    lease_id TEXT PRIMARY KEY,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(job_id),
+    holder_agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    fencing_token INTEGER NOT NULL,
+    acquired_at REAL NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    UNIQUE(resource_type, resource_id)
+);
 """
 
 
