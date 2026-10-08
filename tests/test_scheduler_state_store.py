@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from scheduler.models import TaskState
+from scheduler.leases import QueueStore
 from scheduler.registry import load_registry, with_revision_digest
 from scheduler.state_store import StateConflict, StateStore
 
@@ -41,6 +43,15 @@ def registry_file(root: Path, revision: int = 1, title: str = "Task") -> Path:
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_connection_context_releases_database_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "scheduler.sqlite3")
+            connection = store.connect()
+            with connection:
+                connection.execute("SELECT 1").fetchone()
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+
     def test_import_transition_and_evidence_are_durable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -96,6 +107,25 @@ class StateStoreTests(unittest.TestCase):
             store.import_registry(load_registry(registry_file(root, 1, "Original")))
             with self.assertRaisesRegex(StateConflict, "immutable revision conflict"):
                 store.import_registry(load_registry(registry_file(root, 1, "Changed")))
+
+    def test_revision_switch_cancels_old_nonterminal_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore(root / "scheduler.sqlite3")
+            original = load_registry(registry_file(root))
+            store.import_registry(original)
+            queue = QueueStore(store)
+            queue.enqueue("RFC-20261008-056", "coding", "old-revision", available_at=0)
+
+            revised = load_registry(registry_file(root, 2, "Revised"))
+            store.import_registry(revised)
+
+            task = store.task("RFC-20261008-056")
+            self.assertEqual(task["revision_digest"], revised.rfcs[task["rfc_id"]].revision_digest)
+            self.assertEqual(task["state"], "Draft")
+            job = queue.jobs()[0]
+            self.assertEqual(job["state"], "cancelled")
+            self.assertEqual(job["result"]["failure_kind"], "REVISION_SUPERSEDED")
 
 
 if __name__ == "__main__":

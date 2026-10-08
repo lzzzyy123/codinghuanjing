@@ -18,6 +18,16 @@ class StateConflict(RuntimeError):
     """A state mutation raced or violated the lifecycle."""
 
 
+class ClosingConnection(sqlite3.Connection):
+    """A sqlite connection whose context manager also releases its descriptor."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -157,6 +167,8 @@ CREATE TABLE IF NOT EXISTS review_runs (
     reviewer_agent_id TEXT NOT NULL,
     verdict TEXT,
     infrastructure_status TEXT NOT NULL,
+    schema_valid INTEGER NOT NULL DEFAULT 0,
+    independent INTEGER NOT NULL DEFAULT 0,
     evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
     created_at TEXT NOT NULL
 );
@@ -170,14 +182,34 @@ class StateStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
             connection.execute("PRAGMA journal_mode = WAL")
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(
+            self.path,
+            timeout=30,
+            isolation_level=None,
+            factory=ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        review_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(review_runs)")
+        }
+        if "schema_valid" not in review_columns:
+            connection.execute(
+                "ALTER TABLE review_runs ADD COLUMN schema_valid INTEGER NOT NULL DEFAULT 0"
+            )
+        if "independent" not in review_columns:
+            connection.execute(
+                "ALTER TABLE review_runs ADD COLUMN independent INTEGER NOT NULL DEFAULT 0"
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -245,6 +277,29 @@ class StateStore:
                         raise StateConflict(
                             f"cannot replace pinned revision for active task {rfc_id} in {state.value}"
                         )
+                    active_lease = connection.execute(
+                        "SELECT leases.lease_id FROM leases "
+                        "JOIN jobs ON jobs.job_id = leases.job_id "
+                        "WHERE jobs.rfc_id = ? AND jobs.revision_digest = ? LIMIT 1",
+                        (rfc_id, task["revision_digest"]),
+                    ).fetchone()
+                    if active_lease is not None:
+                        raise StateConflict(
+                            f"cannot replace pinned revision for {rfc_id} while a lease exists"
+                        )
+                    cancellation = json.dumps(
+                        {
+                            "failure_kind": "REVISION_SUPERSEDED",
+                            "superseded_by": rfc.revision_digest,
+                        },
+                        sort_keys=True,
+                    )
+                    connection.execute(
+                        "UPDATE jobs SET state = 'cancelled', result_json = ?, updated_at = ? "
+                        "WHERE rfc_id = ? AND revision_digest = ? "
+                        "AND state IN ('queued', 'leased', 'running')",
+                        (cancellation, now, rfc_id, task["revision_digest"]),
+                    )
                     connection.execute(
                         "UPDATE tasks SET revision_digest = ?, state = ?, reason = NULL, "
                         "updated_at = ? WHERE rfc_id = ?",

@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from .models import TaskState
 from .state_store import StateConflict, StateStore, utc_now
+from .testing import TestEvidenceStore, TestIdentity
 
 
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -164,6 +165,7 @@ class QueueStore:
                 "JOIN tasks ON tasks.rfc_id = jobs.rfc_id "
                 f"WHERE jobs.role = ? AND jobs.kind IN ({placeholders}) "
                 "AND jobs.state = 'queued' AND jobs.available_at <= ? "
+                "AND jobs.revision_digest = tasks.revision_digest "
                 "AND jobs.attempt < jobs.max_attempts "
                 "ORDER BY jobs.priority DESC, jobs.job_id",
                 (role, *sorted(allowed_kinds), timestamp),
@@ -368,6 +370,7 @@ class QueueStore:
         next_priority: int = 0,
         next_max_attempts: int = 3,
         review_record: dict[str, Any] | None = None,
+        test_record: tuple[TestIdentity, str, str] | None = None,
         now: float | None = None,
     ) -> int | None:
         """Atomically publish a fenced result, transition, and enqueue its successor."""
@@ -377,23 +380,42 @@ class QueueStore:
             raise ValueError("next kind and idempotency key must be supplied together")
         timestamp = time.time() if now is None else now
         with self.store.transaction() as connection:
-            self._validated_lease(connection, lease, timestamp)
+            job = self._validated_lease(connection, lease, timestamp)
+            if job["state"] != "running":
+                raise LeaseError(f"job {lease.job_id} is not running")
             task = connection.execute(
                 "SELECT state FROM tasks WHERE rfc_id = ?", (lease.rfc_id,)
             ).fetchone()
             if task is None or task["state"] != expected.value:
                 found = None if task is None else task["state"]
                 raise StateConflict(f"{lease.rfc_id} expected {expected.value}, found {found}")
+            if test_record is not None:
+                identity, test_status, evidence_digest = test_record
+                TestEvidenceStore.record_in_transaction(
+                    connection,
+                    identity,
+                    test_status,
+                    evidence_digest,
+                    expected_rfc_id=lease.rfc_id,
+                    expected_revision_digest=lease.revision_digest,
+                    expected_candidate_digest=(
+                        lease.candidate_digest or str(result.get("candidate_digest", ""))
+                    ),
+                )
             connection.execute(
                 "UPDATE jobs SET state = ?, result_json = ?, updated_at = ? WHERE job_id = ?",
                 (outcome, json.dumps(result, sort_keys=True), utc_now(), lease.job_id),
             )
             if review_record is not None:
+                if lease.kind != "review" or lease.role != "reviewer":
+                    raise StateConflict("review evidence requires an independent Reviewer lease")
+                if review_record["candidate_digest"] != lease.candidate_digest:
+                    raise StateConflict("review candidate does not match the leased job")
                 connection.execute(
                     "INSERT INTO review_runs "
                     "(rfc_id, revision_digest, candidate_digest, reviewer_agent_id, verdict, "
-                    "infrastructure_status, evidence_digest, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "infrastructure_status, schema_valid, independent, evidence_digest, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         lease.rfc_id,
                         lease.revision_digest,
@@ -401,6 +423,8 @@ class QueueStore:
                         lease.holder_agent_id,
                         review_record.get("verdict"),
                         review_record["infrastructure_status"],
+                        1 if review_record.get("schema_valid") else 0,
+                        1,
                         review_record["evidence_digest"],
                         utc_now(),
                     ),
@@ -445,6 +469,152 @@ class QueueStore:
                 ("busy" if active else "idle", lease.holder_agent_id),
             )
             return next_job_id
+
+    def retry_review_infrastructure(
+        self,
+        lease: JobLease,
+        result: dict[str, Any],
+        review_record: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> int | None:
+        """Requeue one unchanged Reviewer job or block it at its attempt limit."""
+        timestamp = time.time() if now is None else now
+        with self.store.transaction() as connection:
+            job = self._validated_lease(connection, lease, timestamp)
+            if job["state"] != "running" or lease.kind != "review" or lease.role != "reviewer":
+                raise LeaseError("Reviewer infrastructure retry requires a running Reviewer job")
+            if review_record["candidate_digest"] != lease.candidate_digest:
+                raise StateConflict("review candidate does not match the leased job")
+            task = connection.execute(
+                "SELECT state FROM tasks WHERE rfc_id = ?", (lease.rfc_id,)
+            ).fetchone()
+            if task is None or task["state"] != TaskState.REVIEWING.value:
+                found = None if task is None else task["state"]
+                raise StateConflict(
+                    f"{lease.rfc_id} expected {TaskState.REVIEWING.value}, found {found}"
+                )
+            connection.execute(
+                "INSERT INTO review_runs "
+                "(rfc_id, revision_digest, candidate_digest, reviewer_agent_id, verdict, "
+                "infrastructure_status, schema_valid, independent, evidence_digest, created_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, 0, 1, ?, ?)",
+                (
+                    lease.rfc_id,
+                    lease.revision_digest,
+                    review_record["candidate_digest"],
+                    lease.holder_agent_id,
+                    review_record["infrastructure_status"],
+                    review_record["evidence_digest"],
+                    utc_now(),
+                ),
+            )
+            exhausted = int(job["attempt"]) >= int(job["max_attempts"])
+            if exhausted:
+                target = TaskState.BLOCKED
+                job_state = "failed"
+                result = {
+                    **result,
+                    "failure_kind": "REVIEW_INFRA_ATTEMPTS_EXHAUSTED",
+                    "attempts": int(job["attempt"]),
+                }
+                reason = (
+                    f"Reviewer infrastructure failed {job['attempt']} times; "
+                    "manual recovery is required"
+                )
+            else:
+                target = TaskState.REVIEW_INFRA_FAILED
+                job_state = "queued"
+                reason = "Reviewer infrastructure failed; unchanged candidate queued for retry"
+            connection.execute(
+                "UPDATE jobs SET state = ?, result_json = ?, available_at = ?, updated_at = ? "
+                "WHERE job_id = ?",
+                (
+                    job_state,
+                    json.dumps(result, sort_keys=True),
+                    timestamp,
+                    utc_now(),
+                    lease.job_id,
+                ),
+            )
+            self._transition_in_transaction(
+                connection,
+                lease.rfc_id,
+                TaskState.REVIEWING,
+                target,
+                f"agent:{lease.holder_agent_id}",
+                reason,
+                {"job_id": lease.job_id, "fencing_token": lease.fencing_token},
+            )
+            connection.execute("DELETE FROM leases WHERE lease_id = ?", (lease.lease_id,))
+            active = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM leases WHERE holder_agent_id = ?",
+                    (lease.holder_agent_id,),
+                ).fetchone()["count"]
+            )
+            connection.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ?",
+                ("busy" if active else "idle", lease.holder_agent_id),
+            )
+            return None if exhausted else lease.job_id
+
+    def approve_reviewed_candidate(
+        self,
+        rfc_id: str,
+        candidate_digest: str,
+        actor: str,
+        idempotency_key: str,
+        *,
+        available_at: float | None = None,
+        max_attempts: int = 3,
+    ) -> int:
+        """Atomically verify independent PASS evidence and enqueue integration."""
+        timestamp = time.time() if available_at is None else available_at
+        with self.store.transaction() as connection:
+            task = connection.execute(
+                "SELECT revision_digest, state FROM tasks WHERE rfc_id = ?", (rfc_id,)
+            ).fetchone()
+            if task is None or task["state"] != TaskState.LEAD_REVIEW.value:
+                found = None if task is None else task["state"]
+                raise StateConflict(
+                    f"{rfc_id} expected {TaskState.LEAD_REVIEW.value}, found {found}"
+                )
+            review = connection.execute(
+                "SELECT review_run_id FROM review_runs WHERE rfc_id = ? "
+                "AND revision_digest = ? AND candidate_digest = ? AND verdict = 'PASS' "
+                "AND infrastructure_status = 'PASS' AND schema_valid = 1 "
+                "AND independent = 1 ORDER BY review_run_id DESC LIMIT 1",
+                (rfc_id, task["revision_digest"], candidate_digest),
+            ).fetchone()
+            if review is None:
+                raise StateConflict(
+                    "integration requires schema-valid independent PASS evidence for this candidate"
+                )
+            self._transition_in_transaction(
+                connection,
+                rfc_id,
+                TaskState.LEAD_REVIEW,
+                TaskState.INTEGRATION_READY,
+                actor,
+                "Project Lead accepted reviewed candidate for integration",
+                {
+                    "candidate_digest": candidate_digest,
+                    "review_run_id": int(review["review_run_id"]),
+                },
+            )
+            return self._enqueue_in_transaction(
+                connection,
+                rfc_id,
+                "integration",
+                "integrator",
+                idempotency_key,
+                candidate_digest,
+                0,
+                max_attempts,
+                timestamp,
+                utc_now(),
+            )
 
     def transition_and_enqueue(
         self,
@@ -493,23 +663,56 @@ class QueueStore:
         recovered: list[int] = []
         with self.store.transaction() as connection:
             rows = connection.execute(
-                "SELECT leases.*, jobs.kind, jobs.rfc_id, jobs.state AS job_state "
+                "SELECT leases.*, jobs.kind, jobs.rfc_id, jobs.state AS job_state, "
+                "jobs.attempt, jobs.max_attempts "
                 "FROM leases JOIN jobs ON jobs.job_id = leases.job_id "
                 "WHERE leases.expires_at <= ? ORDER BY leases.job_id",
                 (timestamp,),
             ).fetchall()
             for row in rows:
-                connection.execute(
-                    "UPDATE jobs SET state = 'queued', available_at = ?, updated_at = ? "
-                    "WHERE job_id = ? AND state IN ('leased', 'running')",
-                    (timestamp, utc_now(), row["job_id"]),
-                )
-                if row["kind"] == "coding":
-                    task = connection.execute(
-                        "SELECT state FROM tasks WHERE rfc_id = ?", (row["rfc_id"],)
-                    ).fetchone()
-                    state = TaskState(task["state"])
-                    if state in {TaskState.LEASED, TaskState.CODING}:
+                task = connection.execute(
+                    "SELECT state FROM tasks WHERE rfc_id = ?", (row["rfc_id"],)
+                ).fetchone()
+                state = TaskState(task["state"])
+                exhausted = int(row["attempt"]) >= int(row["max_attempts"])
+                if exhausted:
+                    result = json.dumps(
+                        {
+                            "failure_kind": "ATTEMPTS_EXHAUSTED",
+                            "attempts": int(row["attempt"]),
+                            "expired_fencing_token": int(row["fencing_token"]),
+                        },
+                        sort_keys=True,
+                    )
+                    connection.execute(
+                        "UPDATE jobs SET state = 'failed', result_json = ?, updated_at = ? "
+                        "WHERE job_id = ? AND state IN ('leased', 'running')",
+                        (result, utc_now(), row["job_id"]),
+                    )
+                    if state not in {TaskState.BLOCKED, TaskState.DONE}:
+                        self._transition_in_transaction(
+                            connection,
+                            str(row["rfc_id"]),
+                            state,
+                            TaskState.BLOCKED,
+                            "scheduler:lease-recovery",
+                            f"{row['kind']} exhausted {row['max_attempts']} attempts",
+                            {
+                                "job_id": row["job_id"],
+                                "expired_fencing_token": row["fencing_token"],
+                                "failure_kind": "ATTEMPTS_EXHAUSTED",
+                            },
+                        )
+                else:
+                    connection.execute(
+                        "UPDATE jobs SET state = 'queued', available_at = ?, updated_at = ? "
+                        "WHERE job_id = ? AND state IN ('leased', 'running')",
+                        (timestamp, utc_now(), row["job_id"]),
+                    )
+                    if row["kind"] == "coding" and state in {
+                        TaskState.LEASED,
+                        TaskState.CODING,
+                    }:
                         self._transition_in_transaction(
                             connection,
                             str(row["rfc_id"]),
@@ -517,6 +720,19 @@ class QueueStore:
                             TaskState.READY,
                             "scheduler:lease-recovery",
                             "expired coding lease recovered",
+                            {
+                                "job_id": row["job_id"],
+                                "expired_fencing_token": row["fencing_token"],
+                            },
+                        )
+                    elif row["kind"] in {"integration", "test_l3"} and state == TaskState.INTEGRATING:
+                        self._transition_in_transaction(
+                            connection,
+                            str(row["rfc_id"]),
+                            state,
+                            TaskState.INTEGRATION_READY,
+                            "scheduler:lease-recovery",
+                            "expired integration lease recovered",
                             {
                                 "job_id": row["job_id"],
                                 "expired_fencing_token": row["fencing_token"],
@@ -542,7 +758,8 @@ class QueueStore:
 
     def _validated_lease(self, connection, lease: JobLease, now: float):
         row = connection.execute(
-            "SELECT leases.*, jobs.state, jobs.revision_digest FROM leases "
+            "SELECT leases.*, jobs.state, jobs.revision_digest, jobs.kind, jobs.role, "
+            "jobs.attempt, jobs.max_attempts, jobs.candidate_digest FROM leases "
             "JOIN jobs ON jobs.job_id = leases.job_id WHERE leases.lease_id = ?",
             (lease.lease_id,),
         ).fetchone()
@@ -553,6 +770,9 @@ class QueueStore:
             or row["holder_agent_id"] != lease.holder_agent_id
             or int(row["fencing_token"]) != lease.fencing_token
             or row["revision_digest"] != lease.revision_digest
+            or row["kind"] != lease.kind
+            or row["role"] != lease.role
+            or row["candidate_digest"] != lease.candidate_digest
         ):
             raise LeaseError("lease fencing validation failed")
         if float(row["expires_at"]) <= now:

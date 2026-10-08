@@ -20,6 +20,7 @@ class ReviewResult:
     infrastructure_status: str
     evidence_digest: str
     required_changes: tuple[str, ...] = ()
+    schema_valid: bool = True
 
 
 class Pipeline:
@@ -35,25 +36,24 @@ class Pipeline:
         lease: JobLease,
         candidate_digest: str,
         level1_identity: TestIdentity,
+        evidence_digest: str,
         *,
         now: float | None = None,
     ) -> int:
         self._validate_candidate(lease, candidate_digest)
         if level1_identity.level != 1 or level1_identity.candidate_digest != candidate_digest:
             raise StateConflict("coding completion requires matching Level 1 evidence")
-        evidence = self.tests.reusable_pass(level1_identity)
-        if evidence is None:
-            raise StateConflict("coding completion requires a passing Level 1 gate")
         return self.queue.finish_and_transition(
             lease,
             "passed",
-            {"candidate_digest": candidate_digest, "level1_evidence": evidence},
+            {"candidate_digest": candidate_digest, "level1_evidence": evidence_digest},
             TaskState.CODING,
             TaskState.TESTING,
             reason="Coder candidate and Level 1 gates passed",
             next_kind="test_l2",
             next_idempotency_key=f"test-l2:{lease.rfc_id}:{candidate_digest}",
             next_candidate_digest=candidate_digest,
+            test_record=(level1_identity, "PASS", evidence_digest),
             now=now,
         )
 
@@ -69,7 +69,6 @@ class Pipeline:
         if lease.kind != "test_l2" or identity.level != 2:
             raise StateConflict("Level 2 result submitted for the wrong job")
         self._validate_candidate(lease, identity.candidate_digest)
-        self.tests.record(identity, status, evidence_digest)
         if status == "PASS":
             target = TaskState.REVIEWING
             next_kind = "review"
@@ -94,6 +93,7 @@ class Pipeline:
             next_kind=next_kind,
             next_idempotency_key=next_key,
             next_candidate_digest=(identity.candidate_digest if next_kind == "review" else None),
+            test_record=(identity, status, evidence_digest),
             now=now,
         )
 
@@ -111,12 +111,24 @@ class Pipeline:
         if result.infrastructure_status == "FAILED":
             if result.verdict is not None:
                 raise StateConflict("review infrastructure failure cannot carry a verdict")
-            target = TaskState.REVIEW_INFRA_FAILED
-            next_kind = "review"
-            next_key = f"review-retry:{lease.rfc_id}:{lease.candidate_digest}:{lease.attempt}"
-            outcome = "failed"
-            reason = "Reviewer infrastructure failed; candidate remains unchanged"
+            return self.queue.retry_review_infrastructure(
+                lease,
+                {
+                    "candidate_digest": lease.candidate_digest,
+                    "verdict": None,
+                    "infrastructure_status": result.infrastructure_status,
+                    "evidence": result.evidence_digest,
+                },
+                {
+                    "candidate_digest": lease.candidate_digest,
+                    "infrastructure_status": result.infrastructure_status,
+                    "evidence_digest": result.evidence_digest,
+                },
+                now=now,
+            )
         elif result.infrastructure_status == "PASS" and result.verdict == "PASS":
+            if not result.schema_valid:
+                raise StateConflict("schema-invalid review cannot PASS")
             if result.required_changes:
                 raise StateConflict("PASS review cannot contain required changes")
             target = TaskState.LEAD_REVIEW
@@ -125,6 +137,8 @@ class Pipeline:
             outcome = "passed"
             reason = "independent Reviewer passed the candidate"
         elif result.infrastructure_status == "PASS" and result.verdict == "REQUEST_CHANGES":
+            if not result.schema_valid:
+                raise StateConflict("schema-invalid review cannot request changes")
             if not result.required_changes:
                 raise StateConflict("REQUEST_CHANGES requires actionable findings")
             target = TaskState.AMENDMENT
@@ -154,6 +168,7 @@ class Pipeline:
                 "candidate_digest": lease.candidate_digest,
                 "verdict": result.verdict,
                 "infrastructure_status": result.infrastructure_status,
+                "schema_valid": result.schema_valid,
                 "evidence_digest": result.evidence_digest,
             },
             now=now,
@@ -169,15 +184,11 @@ class Pipeline:
     ) -> int:
         if not DIGEST_RE.fullmatch(candidate_digest):
             raise ValueError("candidate must be a sha256 digest")
-        return self.queue.transition_and_enqueue(
+        return self.queue.approve_reviewed_candidate(
             rfc_id,
-            TaskState.LEAD_REVIEW,
-            TaskState.INTEGRATION_READY,
+            candidate_digest,
             actor,
-            "Project Lead accepted reviewed candidate for integration",
-            "integration",
             f"integration:{rfc_id}:{candidate_digest}",
-            candidate_digest=candidate_digest,
             available_at=available_at,
         )
 
@@ -192,7 +203,6 @@ class Pipeline:
         if lease.kind != "integration" or level3_identity.level != 3:
             raise StateConflict("Level 3 result submitted for the wrong integration job")
         self._validate_candidate(lease, level3_identity.candidate_digest)
-        self.tests.record(level3_identity, "PASS", evidence_digest)
         self.queue.finish_and_transition(
             lease,
             "passed",
@@ -203,6 +213,7 @@ class Pipeline:
             TaskState.INTEGRATING,
             TaskState.DONE,
             reason="Level 3 integration and full regression gates passed",
+            test_record=(level3_identity, "PASS", evidence_digest),
             now=now,
         )
 

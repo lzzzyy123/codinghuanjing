@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,10 +72,62 @@ class TestEvidenceStore:
         started_at: str | None = None,
         completed_at: str | None = None,
     ) -> None:
+        with self.state.transaction() as connection:
+            self.record_in_transaction(
+                connection,
+                identity,
+                status,
+                evidence_digest,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+    @staticmethod
+    def record_in_transaction(
+        connection: sqlite3.Connection,
+        identity: TestIdentity,
+        status: str,
+        evidence_digest: str,
+        *,
+        expected_rfc_id: str | None = None,
+        expected_revision_digest: str | None = None,
+        expected_candidate_digest: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> None:
         if status not in {"PASS", "FAIL", "INFRA_FAILED"}:
             raise ValueError("invalid test status")
         if not DIGEST_RE.fullmatch(evidence_digest):
             raise ValueError("evidence must be a sha256 digest")
+        if identity.level not in {1, 2, 3}:
+            raise ValueError("test level must be 1, 2, or 3")
+        for value in (identity.revision_digest, identity.candidate_digest):
+            if not DIGEST_RE.fullmatch(value):
+                raise ValueError("revision and candidate must be sha256 digests")
+        if identity.level >= 2 and (
+            identity.baseline_commit is None
+            or not COMMIT_RE.fullmatch(identity.baseline_commit)
+        ):
+            raise ValueError("Level 2/3 requires a full Python baseline commit")
+        expected = (
+            ("RFC", expected_rfc_id, identity.rfc_id),
+            ("revision", expected_revision_digest, identity.revision_digest),
+            ("candidate", expected_candidate_digest, identity.candidate_digest),
+        )
+        for label, required, actual in expected:
+            if required is not None and required != actual:
+                raise StateConflict(f"test {label} does not match the leased job")
+        revision = connection.execute(
+            "SELECT rfc_id FROM rfc_revisions WHERE revision_digest = ?",
+            (identity.revision_digest,),
+        ).fetchone()
+        if revision is None or revision["rfc_id"] != identity.rfc_id:
+            raise StateConflict("test revision does not belong to its RFC")
+        task = connection.execute(
+            "SELECT revision_digest FROM tasks WHERE rfc_id = ?", (identity.rfc_id,)
+        ).fetchone()
+        if task is None or task["revision_digest"] != identity.revision_digest:
+            raise StateConflict("test revision is not the RFC's active revision")
         start = started_at or utc_now()
         complete = completed_at or utc_now()
         values = (
@@ -90,33 +143,32 @@ class TestEvidenceStore:
             start,
             complete,
         )
-        with self.state.transaction() as connection:
-            existing = connection.execute(
-                "SELECT status, evidence_digest FROM test_runs WHERE rfc_id = ? "
-                "AND revision_digest = ? AND candidate_digest = ? AND level = ? "
-                "AND command_digest = ? AND environment_digest = ? "
-                "AND baseline_commit IS ?",
-                (
-                    identity.rfc_id,
-                    identity.revision_digest,
-                    identity.candidate_digest,
-                    identity.level,
-                    identity.command_digest,
-                    identity.environment_digest,
-                    identity.baseline_commit,
-                ),
-            ).fetchone()
-            if existing:
-                if existing["status"] != status or existing["evidence_digest"] != evidence_digest:
-                    raise StateConflict("test identity already has different immutable evidence")
-                return
-            connection.execute(
-                "INSERT INTO test_runs "
-                "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
-                "environment_digest, baseline_commit, status, evidence_digest, started_at, "
-                "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                values,
-            )
+        existing = connection.execute(
+            "SELECT status, evidence_digest FROM test_runs WHERE rfc_id = ? "
+            "AND revision_digest = ? AND candidate_digest = ? AND level = ? "
+            "AND command_digest = ? AND environment_digest = ? "
+            "AND baseline_commit IS ?",
+            (
+                identity.rfc_id,
+                identity.revision_digest,
+                identity.candidate_digest,
+                identity.level,
+                identity.command_digest,
+                identity.environment_digest,
+                identity.baseline_commit,
+            ),
+        ).fetchone()
+        if existing:
+            if existing["status"] != status or existing["evidence_digest"] != evidence_digest:
+                raise StateConflict("test identity already has different immutable evidence")
+            return
+        connection.execute(
+            "INSERT INTO test_runs "
+            "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
+            "environment_digest, baseline_commit, status, evidence_digest, started_at, "
+            "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
 
     def reusable_pass(self, identity: TestIdentity) -> str | None:
         with self.state.connect() as connection:

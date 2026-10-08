@@ -89,6 +89,57 @@ class LeaseTests(unittest.TestCase):
             with self.assertRaisesRegex(LeaseError, "does not exist"):
                 queue.finish(old, "passed", {}, now=11)
 
+    def test_expired_integration_lease_returns_to_claimable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, queue = setup(Path(directory))
+            rfc_id = "RFC-20261008-056"
+            for expected, target in (
+                (TaskState.READY, TaskState.LEASED),
+                (TaskState.LEASED, TaskState.CODING),
+                (TaskState.CODING, TaskState.TESTING),
+                (TaskState.TESTING, TaskState.REVIEWING),
+                (TaskState.REVIEWING, TaskState.LEAD_REVIEW),
+                (TaskState.LEAD_REVIEW, TaskState.INTEGRATION_READY),
+            ):
+                store.transition(rfc_id, expected, target, "fixture")
+            candidate = "sha256:" + "c" * 64
+            queue.enqueue(
+                rfc_id,
+                "integration",
+                "integration:1",
+                candidate_digest=candidate,
+                available_at=0,
+            )
+            queue.register_agent("integrator-a", "integrator", "local", "pid:1", now=0)
+            queue.register_agent("integrator-b", "integrator", "local", "pid:2", now=0)
+            old = queue.claim("integrator-a", now=0, lease_seconds=10)
+            queue.start(old, now=1)
+            self.assertEqual(store.task(rfc_id)["state"], "Integrating")
+            self.assertEqual(queue.recover_expired(now=11), [old.job_id])
+            self.assertEqual(store.task(rfc_id)["state"], "IntegrationReady")
+            replacement = queue.claim("integrator-b", now=11, lease_seconds=10)
+            self.assertIsNotNone(replacement)
+            self.assertGreater(replacement.fencing_token, old.fencing_token)
+
+    def test_expired_job_at_attempt_limit_is_explicitly_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store, queue = setup(Path(directory))
+            queue.register_agent("coder-a", "coder", "xiaosuan-8", "pid:1", now=0)
+            queue.enqueue(
+                "RFC-20261008-056",
+                "coding",
+                "coding:bounded",
+                max_attempts=1,
+                available_at=0,
+            )
+            lease = queue.claim("coder-a", now=0, lease_seconds=10)
+            queue.start(lease, now=1)
+            self.assertEqual(queue.recover_expired(now=11), [lease.job_id])
+            self.assertEqual(store.task(lease.rfc_id)["state"], "Blocked")
+            job = queue.jobs()[0]
+            self.assertEqual(job["state"], "failed")
+            self.assertEqual(job["result"]["failure_kind"], "ATTEMPTS_EXHAUSTED")
+
     def test_heartbeat_extends_lease_and_finish_is_idempotency_fenced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _store, queue = setup(Path(directory))
