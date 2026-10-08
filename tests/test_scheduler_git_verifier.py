@@ -18,6 +18,11 @@ def git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def init_main(repo: Path) -> None:
+    git(repo, "init")
+    git(repo, "checkout", "-b", "main")
+
+
 class GitVerifierTests(unittest.TestCase):
     def test_refresh_trusted_main_fetches_remote_branch_into_dedicated_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -26,7 +31,7 @@ class GitVerifierTests(unittest.TestCase):
             repo = root / "repo"
             git(root, "init", "--bare", str(remote))
             repo.mkdir()
-            git(repo, "init", "-b", "main")
+            init_main(repo)
             git(repo, "remote", "add", "origin", str(remote))
             (repo / "a").write_text("a")
             git(repo, "add", "a")
@@ -53,7 +58,7 @@ class GitVerifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
-            git(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "a").write_text("a")
             git(repo, "add", "a")
             git(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "a")

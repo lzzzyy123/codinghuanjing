@@ -40,13 +40,18 @@ def run(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def init_main(repo: Path) -> None:
+    run(repo, "init")
+    run(repo, "checkout", "-b", "main")
+
+
 class GitBrokerTests(unittest.TestCase):
     def test_worktree_candidate_and_read_only_reviewer_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "README.md").write_text("base\n")
             run(repo, "add", "README.md")
             run(
@@ -131,7 +136,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")
@@ -170,7 +175,7 @@ class GitBrokerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(first.home.stat().st_mode), 0o700)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "a").write_text("a")
             run(repo, "add", "a")
             run(
@@ -202,7 +207,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")
@@ -244,7 +249,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")
@@ -285,7 +290,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")
@@ -317,7 +322,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             sleeper = root / "sleep-prefix"
             sleeper.write_text("#!/bin/sh\nsleep 10\n")
             sleeper.chmod(0o700)
@@ -337,7 +342,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")
@@ -384,7 +389,7 @@ class GitBrokerTests(unittest.TestCase):
             root = Path(directory)
             repo = root / "repo"
             repo.mkdir()
-            run(repo, "init", "-b", "main")
+            init_main(repo)
             (repo / "base").write_text("base\n")
             run(repo, "add", "base")
             run(repo, "-c", "user.name=Test", "-c", "user.email=t@invalid", "commit", "-m", "base")

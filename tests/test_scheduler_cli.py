@@ -24,6 +24,11 @@ def git(cwd: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def init_main(repo: Path) -> None:
+    git(repo, "init")
+    git(repo, "checkout", "-b", "main")
+
+
 def write_fixture(
     root: Path, *, count: int = 1, config_count: int = 0
 ) -> tuple[Path, Path]:
@@ -212,7 +217,7 @@ class SchedulerCliTests(unittest.TestCase):
             repository = root / "repo"
             git(root, "init", "--bare", str(remote))
             repository.mkdir()
-            git(repository, "init", "-b", "main")
+            init_main(repository)
             git(repository, "remote", "add", "origin", str(remote))
             (repository / "base").write_text("base")
             git(repository, "add", "base")
