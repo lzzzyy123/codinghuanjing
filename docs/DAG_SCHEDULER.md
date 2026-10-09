@@ -50,6 +50,11 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
   permission, shared-resource and gate changes are classified
   `NEEDS_HUMAN_APPROVAL`. Missing or stale evidence is `BLOCKED`. No merge
   executor, production wiring, remote fetch, push, or GitHub API call is enabled.
+- Level 3 evidence is bound to the exact trusted-main commit and candidate tree.
+  Authorization also checks the configured Project Lead identity, fixed approved
+  Python baseline, and live trusted remote branch. An immutable eligibility row is historical evidence only: any
+  future executor must re-evaluate it immediately before use and atomically compare
+  the trusted main SHA while publishing. This repository still contains no executor.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 
 ## Three Test Levels

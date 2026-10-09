@@ -30,6 +30,9 @@ class FakeGitVerifier:
         if (ancestor, descendant) not in self.ancestors:
             raise StateConflict("required commit is not an ancestor")
 
+    def candidate_tree(self, _commit: str) -> str:
+        return "b" * 40
+
 
 def item(rfc_id: str, number: int, **changes: object) -> dict:
     value = {
@@ -157,7 +160,8 @@ class ReadinessTests(unittest.TestCase):
                 registry,
                 store,
                 FakeGitVerifier(
-                    {"d" * 40}, {(candidate_commit, "d" * 40)}
+                    {"d" * 40},
+                    {(candidate_commit, "d" * 40), ("a" * 40, "d" * 40)},
                 ),
             )
             scheduler.validate_tasks()
@@ -228,13 +232,13 @@ class ReadinessTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO test_runs "
                     "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
-                    "environment_digest, baseline_commit, status, evidence_digest, "
-                    "started_at, completed_at) VALUES (?, ?, ?, 3, ?, ?, ?, 'PASS', ?, "
-                    "'fixture', 'fixture')",
+                    "environment_digest, baseline_commit, trusted_main_commit, "
+                    "candidate_merge_tree, status, evidence_digest, started_at, completed_at) "
+                    "VALUES (?, ?, ?, 3, ?, ?, ?, ?, ?, 'PASS', ?, 'fixture', 'fixture')",
                     (
                         first["id"], first["revision_digest"], candidate_digest,
                         "sha256:" + "3" * 64, "sha256:" + "4" * 64,
-                        "a" * 40, "sha256:" + "2" * 64,
+                        "a" * 40, "a" * 40, "b" * 40, "sha256:" + "2" * 64,
                     ),
                 )
             with self.assertRaisesRegex(StateConflict, "contract evidence"):

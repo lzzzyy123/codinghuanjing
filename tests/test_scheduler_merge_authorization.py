@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from scheduler.merge_authorization import (
 from scheduler.models import TaskState
 from scheduler.pipeline import Pipeline, ReviewResult
 from scheduler.registry import content_digest, load_registry, with_revision_digest
-from scheduler.state_store import StateStore, utc_now
+from scheduler.state_store import StateConflict, StateStore, utc_now
 from scheduler.testing import TestEvidenceStore, digest_json
 
 
@@ -100,10 +101,13 @@ def complete_fixture(
     capability_group: str = "provider",
     with_dependency: bool = False,
 ) -> Fixture:
+    remote = root / "remote.git"
+    git(root, "init", "--bare", str(remote))
     repo = root / "repo"
     repo.mkdir()
     git(repo, "init")
     git(repo, "checkout", "-b", "main")
+    git(repo, "remote", "add", "origin", str(remote))
     (repo / "README.md").write_text("base\n")
     git(repo, "add", "README.md")
     git(
@@ -117,6 +121,7 @@ def complete_fixture(
         "base",
     )
     base = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "-u", "origin", "main")
 
     definitions: dict[str, object] = {"provider.contract": {"version": 1}}
     contracts = {
@@ -183,6 +188,7 @@ def complete_fixture(
         "candidate",
     )
     commit = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", f"{branch}:{branch}")
     verifier = RepositoryGitVerifier(repo)
     tree = verifier.candidate_tree(commit)
     diff = verifier.candidate_diff_digest(base, commit)
@@ -279,6 +285,8 @@ def complete_fixture(
         list(rfc.level3_tests),
         {},
         BASELINE,
+        base,
+        tree,
     )
     pipeline.complete_integration(integration, level3, level3_evidence, now=11)
 
@@ -313,7 +321,13 @@ def complete_fixture(
         active_id,
         rfc,
         candidate,
-        MergeAuthorizationGate(registry, state, verifier),
+        MergeAuthorizationGate(
+            registry,
+            state,
+            verifier,
+            project_lead_actors=frozenset({"project-lead"}),
+            approved_baseline_commit=BASELINE,
+        ),
         review_evidence,
     )
 
@@ -381,8 +395,9 @@ def insert_dependency_merge(fixture: Fixture, *, stale_contract: bool) -> None:
         level3_id = connection.execute(
             "INSERT INTO test_runs "
             "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
-            "environment_digest, baseline_commit, status, evidence_digest, started_at, "
-            "completed_at) VALUES (?, ?, ?, 3, ?, ?, ?, 'PASS', ?, ?, ?)",
+            "environment_digest, baseline_commit, trusted_main_commit, "
+            "candidate_merge_tree, status, evidence_digest, started_at, completed_at) "
+            "VALUES (?, ?, ?, 3, ?, ?, ?, ?, ?, 'PASS', ?, ?, ?)",
             (
                 DEPENDENCY,
                 dependency.revision_digest,
@@ -390,6 +405,8 @@ def insert_dependency_merge(fixture: Fixture, *, stale_contract: bool) -> None:
                 digest_json(list(dependency.level3_tests)),
                 digest_json({}),
                 BASELINE,
+                fixture.candidate.base_commit,
+                fixture.candidate.tree_sha,
                 fixture.evidence_digest,
                 utc_now(),
                 utc_now(),
@@ -447,6 +464,175 @@ class MergeAuthorizationTests(unittest.TestCase):
             self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
             self.assertFalse(decision.blockers)
             self.assertTrue(decision.risk_reasons)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(
+                Path(directory),
+                target="CODEOWNERS",
+                title="Repository ownership map",
+                capability_group="repository",
+            )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+            )
+            self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
+            self.assertTrue(any("CODEOWNERS" in item for item in decision.risk_reasons))
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            gate = MergeAuthorizationGate(
+                fixture.registry,
+                fixture.state,
+                RepositoryGitVerifier(fixture.repo),
+                project_lead_actors=frozenset({"project-lead"}),
+                approved_baseline_commit="b" * 40,
+            )
+            decision = gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+            )
+            self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
+            self.assertTrue(any("baseline" in item for item in decision.risk_reasons))
+
+    def test_level3_main_binding_and_project_lead_identity_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            with fixture.state.transaction() as connection:
+                connection.execute(
+                    "UPDATE test_runs SET trusted_main_commit = NULL WHERE rfc_id = ? "
+                    "AND level = 3",
+                    (fixture.rfc_id,),
+                )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("Level 3 PASS" in item for item in decision.blockers))
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            with fixture.state.transaction() as connection:
+                connection.execute(
+                    "UPDATE transitions SET actor = 'scheduler' WHERE rfc_id = ? "
+                    "AND from_state = 'LeadReview' AND to_state = 'IntegrationReady'",
+                    (fixture.rfc_id,),
+                )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "scheduler"
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("Project Lead approval" in item for item in decision.blockers))
+
+    def test_publication_requires_trusted_remote_and_live_exact_head(self) -> None:
+        for update, expected in (
+            ("remote = 'backup'", "confirmed remote publication"),
+            ("observed_commit = NULL", "confirmed remote publication"),
+        ):
+            with self.subTest(update=update), tempfile.TemporaryDirectory() as directory:
+                fixture = complete_fixture(Path(directory))
+                with fixture.state.transaction() as connection:
+                    connection.execute(
+                        f"UPDATE publication_records SET {update} WHERE rfc_id = ?",
+                        (fixture.rfc_id,),
+                    )
+                decision = fixture.gate.evaluate(
+                    fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                )
+                self.assertEqual(decision.disposition, BLOCKED)
+                self.assertTrue(any(expected in item for item in decision.blockers))
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            git(fixture.repo, "checkout", "-b", "remote-drift", "main")
+            (fixture.repo / "README.md").write_text("remote drift\n")
+            git(fixture.repo, "add", "README.md")
+            git(
+                fixture.repo,
+                "-c",
+                "user.name=Drift",
+                "-c",
+                "user.email=drift@example.invalid",
+                "commit",
+                "-m",
+                "remote drift",
+            )
+            git(
+                fixture.repo,
+                "push",
+                "origin",
+                f"+remote-drift:refs/heads/{fixture.candidate.branch}",
+            )
+            git(fixture.repo, "checkout", fixture.candidate.branch)
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("trusted remote ref" in item for item in decision.blockers))
+
+    def test_stale_eligibility_must_be_revalidated_before_consumption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            eligible = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+            )
+            self.assertEqual(eligible.disposition, AUTO_MERGE_ELIGIBLE)
+
+            git(fixture.repo, "checkout", "main")
+            (fixture.repo / "README.md").write_text("new main\n")
+            git(fixture.repo, "add", "README.md")
+            git(
+                fixture.repo,
+                "-c",
+                "user.name=Main",
+                "-c",
+                "user.email=main@example.invalid",
+                "commit",
+                "-m",
+                "advance main",
+            )
+            git(fixture.repo, "push", "origin", "main")
+            git(fixture.repo, "checkout", fixture.candidate.branch)
+
+            with self.assertRaisesRegex(StateConflict, "stale"):
+                fixture.gate.require_current_eligibility(eligible.decision_digest)
+
+    def test_revision_gate_and_contract_changes_require_human_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            predecessor = dict(fixture.rfc.raw)
+            predecessor_digest = "sha256:" + "9" * 64
+            with fixture.state.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO rfc_revisions VALUES (?, 0, ?, ?, ?, ?)",
+                    (
+                        fixture.rfc_id,
+                        predecessor_digest,
+                        fixture.registry.digest,
+                        json.dumps(predecessor, sort_keys=True),
+                        utc_now(),
+                    ),
+                )
+                current_raw = dict(fixture.rfc.raw)
+                current_raw["supersedes"] = {
+                    "revision": 1,
+                    "revision_digest": predecessor_digest,
+                }
+                current_raw["tests"] = {
+                    **current_raw["tests"],
+                    "level3": ["different gate"],
+                }
+                current_raw["contracts"] = {
+                    "provides": {"shared.api": "sha256:" + "7" * 64},
+                    "requires": {},
+                    "definitions": {},
+                }
+                current = replace(fixture.rfc, revision=2, raw=current_raw)
+                blockers: list[str] = []
+                reasons = fixture.gate._revision_risk_reasons(
+                    connection, current, blockers.append
+                )
+            self.assertFalse(blockers)
+            self.assertTrue(any("test gate" in item for item in reasons))
+            self.assertTrue(any("interface contract" in item for item in reasons))
 
     def test_missing_required_evidence_blocks(self) -> None:
         cases = {

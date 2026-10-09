@@ -88,13 +88,21 @@ class DagScheduler:
             if review is None:
                 raise StateConflict("merge evidence requires independent PASS for the candidate")
             level3 = connection.execute(
-                "SELECT test_run_id FROM test_runs WHERE rfc_id = ? "
+                "SELECT test_run_id, trusted_main_commit, candidate_merge_tree "
+                "FROM test_runs WHERE rfc_id = ? "
                 "AND revision_digest = ? AND candidate_digest = ? AND level = 3 "
-                "AND status = 'PASS' ORDER BY test_run_id DESC LIMIT 1",
+                "AND status = 'PASS' AND trusted_main_commit IS NOT NULL "
+                "AND candidate_merge_tree IS NOT NULL "
+                "ORDER BY test_run_id DESC LIMIT 1",
                 (rfc_id, task["revision_digest"], candidate_digest),
             ).fetchone()
             if level3 is None:
                 raise StateConflict("merge evidence requires Level 3 PASS for the candidate")
+            self.git_verifier.require_ancestor(
+                str(level3["trusted_main_commit"]), merge_commit
+            )
+            if self.git_verifier.candidate_tree(merge_commit) != level3["candidate_merge_tree"]:
+                raise StateConflict("merge commit tree does not match the Level 3 candidate tree")
             self.git_verifier.require_ancestor(str(candidate["commit_sha"]), merge_commit)
             existing = connection.execute(
                 "SELECT * FROM merge_records WHERE rfc_id = ?", (rfc_id,)

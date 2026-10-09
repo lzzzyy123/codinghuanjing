@@ -17,7 +17,7 @@ from typing import Any
 from .git_verifier import GitVerificationError, RepositoryGitVerifier
 from .models import TaskState
 from .registry import Registry, RfcRevision
-from .state_store import StateStore, utc_now
+from .state_store import StateConflict, StateStore, utc_now
 from .testing import digest_json
 
 
@@ -31,7 +31,13 @@ BLOCKED = "BLOCKED"
 
 SENSITIVE_EXACT_PATHS = frozenset(
     {
+        ".env",
+        ".gitattributes",
         ".gitignore",
+        ".gitmodules",
+        ".npmrc",
+        "CODEOWNERS",
+        "Dockerfile",
         "PARITY.md",
         "bun.lock",
         "bunfig.toml",
@@ -51,7 +57,10 @@ SENSITIVE_PREFIXES = (
     "service/",
     "templates/",
     "tests/final/",
+    "tests/differential/",
     "tests/integration/",
+    "tests/parity/",
+    "tests/regression/",
     "tools/",
     "worker/",
 )
@@ -100,10 +109,37 @@ class MergeAuthorizationGate:
         registry: Registry,
         store: StateStore,
         git_verifier: RepositoryGitVerifier,
+        *,
+        project_lead_actors: frozenset[str] = frozenset(),
+        trusted_publication_remote: str = "origin",
+        trusted_main_branch: str = "main",
+        approved_baseline_commit: str | None = None,
     ) -> None:
+        if not project_lead_actors or any(
+            not actor.strip() for actor in project_lead_actors
+        ):
+            raise ValueError("at least one trusted Project Lead actor is required")
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", trusted_publication_remote
+        ):
+            raise ValueError("invalid trusted publication remote")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}", trusted_main_branch)
+            or ".." in trusted_main_branch
+            or trusted_main_branch.startswith("-")
+        ):
+            raise ValueError("invalid trusted main branch")
+        if approved_baseline_commit is None or not COMMIT_RE.fullmatch(
+            approved_baseline_commit
+        ):
+            raise ValueError("an approved full Python baseline commit is required")
         self.registry = registry
         self.store = store
         self.git_verifier = git_verifier
+        self.project_lead_actors = frozenset(project_lead_actors)
+        self.trusted_publication_remote = trusted_publication_remote
+        self.trusted_main_branch = trusted_main_branch
+        self.approved_baseline_commit = approved_baseline_commit
 
     def evaluate(
         self, rfc_id: str, candidate_digest: str, requested_by: str
@@ -118,6 +154,8 @@ class MergeAuthorizationGate:
         rfc = self.registry.rfcs[rfc_id]
         blockers: list[str] = []
         risk_reasons: set[str] = set()
+        if self.registry.baseline_commit != self.approved_baseline_commit:
+            risk_reasons.add("Python baseline differs from the approved migration baseline")
         evidence: dict[str, Any] = {
             "registry_digest": self.registry.digest,
             "baseline_commit": self.registry.baseline_commit,
@@ -128,6 +166,20 @@ class MergeAuthorizationGate:
         def block(reason: str) -> None:
             if reason not in blockers:
                 blockers.append(reason)
+
+        trusted_main_commit: str | None = None
+        try:
+            trusted_main_commit = self.git_verifier.resolve_trusted_main()
+            evidence["trusted_main_commit"] = trusted_main_commit
+            live_main_commit = self.git_verifier.resolve_remote_head(
+                self.trusted_publication_remote,
+                f"refs/heads/{self.trusted_main_branch}",
+            )
+            evidence["trusted_remote_main_commit"] = live_main_commit
+            if live_main_commit != trusted_main_commit:
+                block("trusted local main ref is stale relative to the remote main branch")
+        except (GitVerificationError, ValueError) as exc:
+            block(f"trusted main verification failed: {exc}")
 
         with self.store.transaction() as connection:
             task = connection.execute(
@@ -165,6 +217,7 @@ class MergeAuthorizationGate:
             candidate_commit: str | None = None
             head_ref: str | None = None
             changed_paths: tuple[str, ...] = ()
+            expected_merge_tree: str | None = None
             if candidate is None:
                 block("exact persisted Coder candidate is missing")
             else:
@@ -199,6 +252,13 @@ class MergeAuthorizationGate:
                     changed_paths = self.git_verifier.changed_paths(
                         str(candidate["base_commit"]), candidate_commit
                     )
+                    if trusted_main_commit is not None:
+                        expected_merge_tree = self.git_verifier.candidate_merge_tree(
+                            str(candidate["base_commit"]),
+                            trusted_main_commit,
+                            candidate_commit,
+                        )
+                        evidence["candidate_merge_tree"] = expected_merge_tree
                     evidence["changed_paths"] = list(changed_paths)
                     if actual_tree != candidate["tree_sha"]:
                         block("candidate tree does not match the reviewed commit")
@@ -214,6 +274,7 @@ class MergeAuthorizationGate:
                         block(f"candidate changes frozen control path: {path}")
 
             risk_reasons.update(self._risk_reasons(rfc, changed_paths))
+            risk_reasons.update(self._revision_risk_reasons(connection, rfc, block))
 
             coder = self._passed_job(
                 connection, rfc_id, rfc.revision_digest, candidate_digest, "coding"
@@ -245,20 +306,34 @@ class MergeAuthorizationGate:
                     level_runs[level] = None
                     continue
                 baseline = None if level == 1 else self.registry.baseline_commit
-                run = connection.execute(
+                level3_tree = (
+                    expected_merge_tree
+                    if level == 3 and candidate is not None and trusted_main_commit is not None
+                    else None
+                )
+                level3_clause = (
+                    "AND trusted_main_commit = ? AND candidate_merge_tree = ? "
+                    if level == 3
+                    else ""
+                )
+                parameters: tuple[Any, ...] = (
+                    rfc_id,
+                    rfc.revision_digest,
+                    candidate_digest,
+                    level,
+                    digest_json(list(commands)),
+                    baseline,
+                )
+                if level == 3:
+                    parameters += (trusted_main_commit, level3_tree)
+                query = (
                     "SELECT * FROM test_runs WHERE rfc_id = ? AND revision_digest = ? "
                     "AND candidate_digest = ? AND level = ? AND command_digest = ? "
                     "AND baseline_commit IS ? AND status = 'PASS' "
-                    "ORDER BY test_run_id DESC LIMIT 1",
-                    (
-                        rfc_id,
-                        rfc.revision_digest,
-                        candidate_digest,
-                        level,
-                        digest_json(list(commands)),
-                        baseline,
-                    ),
-                ).fetchone()
+                    + level3_clause
+                    + "ORDER BY test_run_id DESC LIMIT 1"
+                )
+                run = connection.execute(query, parameters).fetchone()
                 level_runs[level] = run
                 if run is None:
                     label = "module and Python differential" if level == 2 else f"Level {level}"
@@ -303,7 +378,11 @@ class MergeAuthorizationGate:
                     block("integration job result is not bound to the Level 3 evidence")
 
             approval = self._project_lead_approval(
-                connection, rfc_id, rfc.revision_digest, candidate_digest
+                connection,
+                rfc_id,
+                rfc.revision_digest,
+                candidate_digest,
+                self.project_lead_actors,
             )
             review = None
             if approval is None:
@@ -348,7 +427,8 @@ class MergeAuthorizationGate:
                 publication = connection.execute(
                     "SELECT publication_id FROM publication_records WHERE rfc_id = ? "
                     "AND revision_digest = ? AND candidate_digest = ? AND ref_name = ? "
-                    "AND target_commit = ? AND state = 'confirmed' "
+                    "AND target_commit = ? AND remote = ? AND state = 'confirmed' "
+                    "AND observed_commit = target_commit AND last_error IS NULL "
                     "ORDER BY publication_id DESC LIMIT 1",
                     (
                         rfc_id,
@@ -356,12 +436,23 @@ class MergeAuthorizationGate:
                         candidate_digest,
                         ref_name,
                         candidate["commit_sha"],
+                        self.trusted_publication_remote,
                     ),
                 ).fetchone()
                 if publication is None:
                     block("confirmed remote publication is missing for the exact candidate")
                 else:
                     evidence["publication_id"] = int(publication["publication_id"])
+                    evidence["publication_remote"] = self.trusted_publication_remote
+                    try:
+                        remote_commit = self.git_verifier.resolve_remote_head(
+                            self.trusted_publication_remote, ref_name
+                        )
+                        evidence["publication_remote_commit"] = remote_commit
+                        if remote_commit != candidate["commit_sha"]:
+                            block("trusted remote ref does not identify the reviewed candidate")
+                    except (GitVerificationError, ValueError) as exc:
+                        block(f"trusted remote publication verification failed: {exc}")
                 unresolved = connection.execute(
                     "SELECT state FROM publication_records WHERE ref_name = ? "
                     "AND state IN ('prepared', 'published', 'blocked') LIMIT 1",
@@ -471,6 +562,32 @@ class MergeAuthorizationGate:
             requested_by=requested_by,
             created_at=created_at,
         )
+
+    def require_current_eligibility(
+        self, decision_digest: str
+    ) -> MergeAuthorizationDecision:
+        """Re-evaluate an immutable decision immediately before any later executor uses it."""
+        if not DIGEST_RE.fullmatch(decision_digest):
+            raise ValueError("decision_digest must be a sha256 digest")
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM merge_authorization_decisions WHERE decision_digest = ?",
+                (decision_digest,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("merge authorization decision does not exist")
+        prior = self._decision(row)
+        if prior.disposition != AUTO_MERGE_ELIGIBLE:
+            raise StateConflict("merge authorization decision is not auto-merge eligible")
+        current = self.evaluate(
+            prior.rfc_id, prior.candidate_digest, prior.requested_by
+        )
+        if (
+            current.decision_digest != decision_digest
+            or current.disposition != AUTO_MERGE_ELIGIBLE
+        ):
+            raise StateConflict("merge authorization decision is stale; current evidence differs")
+        return current
 
     def history(self, rfc_id: str) -> tuple[MergeAuthorizationDecision, ...]:
         with self.store.connect() as connection:
@@ -622,6 +739,35 @@ class MergeAuthorizationGate:
                 reasons.add(f"security, permission, or credential path: {path}")
         return reasons
 
+    def _revision_risk_reasons(self, connection, rfc: RfcRevision, block) -> set[str]:
+        if rfc.revision == 1:
+            return set()
+        supersedes = rfc.raw.get("supersedes")
+        predecessor_digest = (
+            supersedes.get("revision_digest") if isinstance(supersedes, dict) else None
+        )
+        row = connection.execute(
+            "SELECT payload_json FROM rfc_revisions WHERE rfc_id = ? "
+            "AND revision_digest = ?",
+            (rfc.rfc_id, predecessor_digest),
+        ).fetchone()
+        if row is None:
+            block("superseded RFC revision is unavailable for risk comparison")
+            return set()
+        try:
+            previous = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            block("superseded RFC revision is malformed")
+            return set()
+        reasons: set[str] = set()
+        if previous.get("tests") != rfc.raw.get("tests"):
+            reasons.add("test gate definition changed from the superseded RFC revision")
+        previous_contracts = previous.get("contracts", {})
+        current_contracts = rfc.raw.get("contracts", {})
+        if previous_contracts.get("provides", {}) != current_contracts.get("provides", {}):
+            reasons.add("provided shared interface contract changed from the superseded revision")
+        return reasons
+
     @staticmethod
     def _owned_by(rfc: RfcRevision, path: str) -> bool:
         return path in rfc.target_files or any(
@@ -661,7 +807,13 @@ class MergeAuthorizationGate:
         return result if isinstance(result, dict) else {}
 
     @staticmethod
-    def _project_lead_approval(connection, rfc_id, revision_digest, candidate_digest):
+    def _project_lead_approval(
+        connection,
+        rfc_id,
+        revision_digest,
+        candidate_digest,
+        trusted_actors: frozenset[str],
+    ):
         rows = connection.execute(
             "SELECT sequence, actor, metadata_json FROM transitions WHERE rfc_id = ? "
             "AND revision_digest = ? AND from_state = ? AND to_state = ? "
@@ -683,8 +835,7 @@ class MergeAuthorizationGate:
             if (
                 metadata.get("candidate_digest") == candidate_digest
                 and isinstance(review_id, int)
-                and actor.strip()
-                and not actor.startswith("agent:")
+                and actor in trusted_actors
             ):
                 return review_id, actor, int(row["sequence"])
         return None

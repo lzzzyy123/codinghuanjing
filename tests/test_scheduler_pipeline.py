@@ -189,6 +189,8 @@ class PipelineTests(unittest.TestCase):
                 ["bun test", "bun run differential:all"],
                 {},
                 "a" * 40,
+                "a" * 40,
+                TREE,
             )
             pipeline.complete_integration(integration, level3, level3_log, now=11)
             self.assertEqual(state.task(rfc["id"])["state"], "Done")

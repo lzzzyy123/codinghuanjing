@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import tempfile
 from pathlib import Path
 
 from .runner import RunnerError, RunnerTimeout, run_bounded
@@ -57,6 +58,31 @@ class RepositoryGitVerifier:
                 f"{ref_name} does not identify the reviewed candidate {expected_commit}"
             )
 
+    def resolve_remote_head(self, remote: str, ref_name: str) -> str | None:
+        """Resolve one exact remote branch without changing local refs."""
+        if not REMOTE_RE.fullmatch(remote):
+            raise ValueError("invalid Git remote name")
+        if (
+            not ref_name.startswith("refs/heads/")
+            or not REF_RE.fullmatch(ref_name)
+            or ".." in ref_name
+        ):
+            raise ValueError("invalid fully-qualified remote branch")
+        result = self._git("ls-remote", "--heads", remote, ref_name)
+        output = str(result.stdout).strip()
+        if not output:
+            return None
+        rows = output.splitlines()
+        if len(rows) != 1:
+            raise GitVerificationError(f"remote ref resolved ambiguously: {ref_name}")
+        try:
+            commit, resolved_ref = rows[0].split("\t", 1)
+        except ValueError as exc:
+            raise GitVerificationError("remote returned malformed ref data") from exc
+        if resolved_ref != ref_name or not COMMIT_RE.fullmatch(commit):
+            raise GitVerificationError(f"remote returned invalid data for {ref_name}")
+        return commit
+
     def candidate_tree(self, commit: str) -> str:
         self.require_commit(commit)
         return self._resolve(f"{commit}^{{tree}}")
@@ -74,6 +100,50 @@ class RepositoryGitVerifier:
             "--",
         )
         return "sha256:" + hashlib.sha256(result.stdout).hexdigest()
+
+    def candidate_merge_tree(
+        self, base_commit: str, trusted_main_commit: str, candidate_commit: str
+    ) -> str:
+        """Compute the candidate-on-main tree without changing refs or the object store."""
+        self.require_ancestor(base_commit, trusted_main_commit)
+        self.require_ancestor(base_commit, candidate_commit)
+        if trusted_main_commit == base_commit:
+            return self.candidate_tree(candidate_commit)
+        if trusted_main_commit == candidate_commit:
+            return self.candidate_tree(candidate_commit)
+
+        common = Path(str(self._git("rev-parse", "--git-common-dir").stdout).strip())
+        if not common.is_absolute():
+            common = (self.repository / common).resolve()
+        object_directory = common / "objects"
+        if not object_directory.is_dir():
+            raise GitVerificationError("Git common object directory is unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="merge-tree-") as directory:
+            quarantine = Path(directory) / "objects"
+            quarantine.mkdir()
+            result = self._git(
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                trusted_main_commit,
+                candidate_commit,
+                check=False,
+                extra_env={
+                    "GIT_OBJECT_DIRECTORY": str(quarantine),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(object_directory),
+                },
+            )
+            if result.returncode != 0:
+                raise GitVerificationError(
+                    "candidate does not merge cleanly with trusted main: "
+                    f"{str(result.stderr)[-2000:]}"
+                )
+            output = str(result.stdout).strip().splitlines()
+            tree = output[0] if output else ""
+            if not COMMIT_RE.fullmatch(tree):
+                raise GitVerificationError("git merge-tree did not return a tree SHA")
+            return tree
 
     def changed_paths(self, base_commit: str, commit: str) -> tuple[str, ...]:
         self.require_ancestor(base_commit, commit)
@@ -148,20 +218,27 @@ class RepositoryGitVerifier:
             raise GitVerificationError(f"Git did not resolve a full commit for {value}")
         return resolved
 
-    def _git(self, *arguments: str, check: bool = True):
+    def _git(
+        self,
+        *arguments: str,
+        check: bool = True,
+        extra_env: dict[str, str] | None = None,
+    ):
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/nonexistent"),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        environment.update(extra_env or {})
         try:
             result = run_bounded(
                 ["git", "-C", str(self.repository), *arguments],
                 cwd=self.repository,
-                env={
-                    "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                    "HOME": os.environ.get("HOME", "/nonexistent"),
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "GIT_OPTIONAL_LOCKS": "0",
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CONFIG_GLOBAL": os.devnull,
-                    "LANG": os.environ.get("LANG", "C.UTF-8"),
-                },
+                env=environment,
                 timeout_seconds=self.timeout_seconds,
             )
         except (RunnerError, RunnerTimeout) as exc:

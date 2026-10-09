@@ -52,6 +52,37 @@ def registry_file(root: Path, revision: int = 1, title: str = "Task") -> Path:
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_migration_adds_level3_main_binding_columns_without_rewriting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "scheduler.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE test_runs ("
+                "test_run_id INTEGER PRIMARY KEY AUTOINCREMENT, rfc_id TEXT NOT NULL, "
+                "revision_digest TEXT NOT NULL, candidate_digest TEXT NOT NULL, "
+                "level INTEGER NOT NULL, command_digest TEXT NOT NULL, "
+                "environment_digest TEXT NOT NULL, baseline_commit TEXT, "
+                "status TEXT NOT NULL, evidence_digest TEXT NOT NULL, "
+                "started_at TEXT NOT NULL, completed_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO test_runs "
+                "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
+                "environment_digest, baseline_commit, status, evidence_digest, "
+                "started_at, completed_at) VALUES "
+                "('RFC-20261008-056', 'revision', 'candidate', 3, 'command', "
+                "'environment', 'baseline', 'PASS', 'evidence', 'start', 'complete')"
+            )
+            connection.commit()
+            connection.close()
+
+            StateStore(database)
+            with sqlite3.connect(database) as migrated:
+                migrated.row_factory = sqlite3.Row
+                row = migrated.execute("SELECT * FROM test_runs").fetchone()
+                self.assertIsNone(row["trusted_main_commit"])
+                self.assertIsNone(row["candidate_merge_tree"])
+
     def test_connection_context_releases_database_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "scheduler.sqlite3")

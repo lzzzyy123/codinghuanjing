@@ -180,6 +180,8 @@ CREATE TABLE IF NOT EXISTS test_runs (
     command_digest TEXT NOT NULL,
     environment_digest TEXT NOT NULL,
     baseline_commit TEXT,
+    trusted_main_commit TEXT,
+    candidate_merge_tree TEXT,
     status TEXT NOT NULL,
     evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
     started_at TEXT NOT NULL,
@@ -317,6 +319,13 @@ class StateStore:
             connection.execute(
                 "ALTER TABLE review_runs ADD COLUMN independent INTEGER NOT NULL DEFAULT 0"
             )
+        test_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(test_runs)")
+        }
+        if "trusted_main_commit" not in test_columns:
+            connection.execute("ALTER TABLE test_runs ADD COLUMN trusted_main_commit TEXT")
+        if "candidate_merge_tree" not in test_columns:
+            connection.execute("ALTER TABLE test_runs ADD COLUMN candidate_merge_tree TEXT")
         job_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)")
         }
