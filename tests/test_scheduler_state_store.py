@@ -52,6 +52,135 @@ def registry_file(root: Path, revision: int = 1, title: str = "Task") -> Path:
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_legacy_merge_authorization_records_create_cutover_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "scheduler.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE merge_authorization_decisions (
+                        decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        decision_digest TEXT NOT NULL UNIQUE,
+                        rfc_id TEXT NOT NULL,
+                        revision_digest TEXT NOT NULL,
+                        candidate_digest TEXT NOT NULL,
+                        candidate_commit TEXT,
+                        head_ref TEXT,
+                        disposition TEXT NOT NULL,
+                        policy_version TEXT NOT NULL,
+                        risk_json TEXT NOT NULL,
+                        blockers_json TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL,
+                        requested_by TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE merge_authorization_reservations (
+                        reservation_id TEXT PRIMARY KEY,
+                        reservation_key TEXT NOT NULL UNIQUE,
+                        decision_digest TEXT NOT NULL,
+                        rfc_id TEXT NOT NULL,
+                        candidate_digest TEXT NOT NULL,
+                        holder_identity TEXT NOT NULL,
+                        expected_trusted_main_commit TEXT NOT NULL,
+                        fencing_token INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        expires_at REAL NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(decision_digest, fencing_token)
+                    );
+                    CREATE TABLE project_lead_approvals (
+                        approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        rfc_id TEXT NOT NULL,
+                        revision_digest TEXT NOT NULL,
+                        candidate_digest TEXT NOT NULL,
+                        review_run_id INTEGER NOT NULL,
+                        actor TEXT NOT NULL,
+                        channel TEXT NOT NULL,
+                        evidence_digest TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(rfc_id, revision_digest, candidate_digest, review_run_id)
+                    );
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO merge_authorization_decisions VALUES "
+                    "(1, ?, 'RFC-20261008-056', ?, ?, ?, 'refs/heads/agent/x', "
+                    "'AUTO_MERGE_ELIGIBLE', 'v1', '[]', '[]', '{}', 'lead', 'fixture')",
+                    ("sha256:" + "1" * 64, "sha256:" + "2" * 64,
+                     "sha256:" + "3" * 64, "a" * 40),
+                )
+                connection.execute(
+                    "INSERT INTO merge_authorization_reservations VALUES "
+                    "('reservation', 'key', ?, 'RFC-20261008-056', ?, "
+                    "'merge-broker:legacy', ?, 1, 'reserved', 999999, "
+                    "'fixture', 'fixture')",
+                    ("sha256:" + "1" * 64, "sha256:" + "3" * 64, "b" * 40),
+                )
+                connection.execute(
+                    "INSERT INTO project_lead_approvals VALUES "
+                    "(1, 'RFC-20261008-056', ?, ?, 1, 'project-lead:legacy', "
+                    "'mac-codex:legacy', ?, 'fixture')",
+                    ("sha256:" + "2" * 64, "sha256:" + "3" * 64,
+                     "sha256:" + "4" * 64),
+                )
+
+            store = StateStore(database)
+            with store.connect() as connection:
+                reservation = connection.execute(
+                    "SELECT authorization_subject_digest "
+                    "FROM merge_authorization_reservations"
+                ).fetchone()
+                approval = connection.execute(
+                    "SELECT attestation FROM project_lead_approvals"
+                ).fetchone()
+                blocker = connection.execute(
+                    "SELECT kind, details_json, resolved_at FROM migration_blockers "
+                    "WHERE blocker_key = 'merge-authorization-v2-migration-required'"
+                ).fetchone()
+            self.assertIsNone(reservation["authorization_subject_digest"])
+            self.assertIsNone(approval["attestation"])
+            self.assertEqual(blocker["kind"], "MERGE_AUTHORIZATION_MIGRATION_REQUIRED")
+            self.assertEqual(
+                json.loads(blocker["details_json"]),
+                {
+                    "legacy_active_authorizations": 1,
+                    "legacy_project_lead_approvals": 1,
+                },
+            )
+            self.assertIsNone(blocker["resolved_at"])
+
+    def test_migration_adds_level3_main_binding_columns_without_rewriting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "scheduler.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE test_runs ("
+                "test_run_id INTEGER PRIMARY KEY AUTOINCREMENT, rfc_id TEXT NOT NULL, "
+                "revision_digest TEXT NOT NULL, candidate_digest TEXT NOT NULL, "
+                "level INTEGER NOT NULL, command_digest TEXT NOT NULL, "
+                "environment_digest TEXT NOT NULL, baseline_commit TEXT, "
+                "status TEXT NOT NULL, evidence_digest TEXT NOT NULL, "
+                "started_at TEXT NOT NULL, completed_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO test_runs "
+                "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
+                "environment_digest, baseline_commit, status, evidence_digest, "
+                "started_at, completed_at) VALUES "
+                "('RFC-20261008-056', 'revision', 'candidate', 3, 'command', "
+                "'environment', 'baseline', 'PASS', 'evidence', 'start', 'complete')"
+            )
+            connection.commit()
+            connection.close()
+
+            StateStore(database)
+            with sqlite3.connect(database) as migrated:
+                migrated.row_factory = sqlite3.Row
+                row = migrated.execute("SELECT * FROM test_runs").fetchone()
+                self.assertIsNone(row["trusted_main_commit"])
+                self.assertIsNone(row["candidate_merge_tree"])
+
     def test_connection_context_releases_database_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "scheduler.sqlite3")

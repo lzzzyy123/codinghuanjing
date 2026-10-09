@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import tempfile
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from .runner import RunnerError, RunnerTimeout, run_bounded
 
@@ -12,6 +15,9 @@ from .runner import RunnerError, RunnerTimeout, run_bounded
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SCP_REMOTE_RE = re.compile(
+    r"^(?:[^@/:\s]+@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^\s]+)$"
+)
 
 
 class GitVerificationError(RuntimeError):
@@ -38,6 +44,221 @@ class RepositoryGitVerifier:
 
     def resolve_trusted_main(self) -> str:
         return self._resolve(self.trusted_main_ref)
+
+    def resolve_ref(self, ref_name: str) -> str:
+        """Resolve one fully-qualified local ref without changing repository state."""
+        if (
+            not ref_name.startswith("refs/")
+            or not REF_RE.fullmatch(ref_name)
+            or ".." in ref_name
+        ):
+            raise ValueError("invalid fully-qualified Git ref")
+        return self._resolve(ref_name)
+
+    def require_exact_ref(self, ref_name: str, expected_commit: str) -> None:
+        self.require_commit(expected_commit)
+        if self.resolve_ref(ref_name) != expected_commit:
+            raise GitVerificationError(
+                f"{ref_name} does not identify the reviewed candidate {expected_commit}"
+            )
+
+    def resolve_remote_head(self, remote: str, ref_name: str) -> str | None:
+        """Resolve one exact remote branch without changing local refs."""
+        if not REMOTE_RE.fullmatch(remote):
+            raise ValueError("invalid Git remote name")
+        if (
+            not ref_name.startswith("refs/heads/")
+            or not REF_RE.fullmatch(ref_name)
+            or ".." in ref_name
+        ):
+            raise ValueError("invalid fully-qualified remote branch")
+        result = self._git("ls-remote", "--heads", remote, ref_name, check=False)
+        if result.returncode != 0:
+            # Remote stderr can echo a credential-bearing configured URL. Keep
+            # authorization evidence useful without persisting that diagnostic.
+            raise GitVerificationError(
+                f"remote ref query failed ({result.returncode}) for {ref_name}"
+            )
+        output = str(result.stdout).strip()
+        if not output:
+            return None
+        rows = output.splitlines()
+        if len(rows) != 1:
+            raise GitVerificationError(f"remote ref resolved ambiguously: {ref_name}")
+        try:
+            commit, resolved_ref = rows[0].split("\t", 1)
+        except ValueError as exc:
+            raise GitVerificationError("remote returned malformed ref data") from exc
+        if resolved_ref != ref_name or not COMMIT_RE.fullmatch(commit):
+            raise GitVerificationError(f"remote returned invalid data for {ref_name}")
+        return commit
+
+    def remote_identity(self, remote: str) -> str:
+        """Return a credential-free normalized repository identity for a remote."""
+        if not REMOTE_RE.fullmatch(remote):
+            raise ValueError("invalid Git remote name")
+        identities: list[str] = []
+        for mode in ("fetch", "push"):
+            arguments = ["remote", "get-url", "--all"]
+            if mode == "push":
+                arguments.append("--push")
+            arguments.append(remote)
+            result = self._git(*arguments)
+            urls = [
+                line.strip() for line in str(result.stdout).splitlines() if line.strip()
+            ]
+            if len(urls) != 1:
+                raise GitVerificationError(
+                    f"trusted remote must have exactly one {mode} URL"
+                )
+            identities.append(self.normalize_remote_identity(urls[0]))
+        if identities[0] != identities[1]:
+            raise GitVerificationError(
+                "trusted remote fetch and push URLs identify different repositories"
+            )
+        return identities[0]
+
+    def resolve_pinned_remote_head(
+        self, remote: str, expected_identity: str, ref_name: str
+    ) -> str | None:
+        """Resolve a remote ref while detecting alias retargeting around the request."""
+        before = self.remote_identity(remote)
+        if before != expected_identity:
+            raise GitVerificationError("Git remote does not match the pinned repository identity")
+        commit = self.resolve_remote_head(remote, ref_name)
+        after = self.remote_identity(remote)
+        if after != before:
+            raise GitVerificationError("Git remote identity changed during verification")
+        return commit
+
+    def normalize_remote_identity(self, value: str) -> str:
+        """Normalize SSH/HTTPS/file spellings without retaining credentials."""
+        candidate = value.strip()
+        if not candidate or any(ord(character) < 32 for character in candidate):
+            raise ValueError("invalid Git remote URL")
+        parsed = urlsplit(candidate)
+        if parsed.scheme and parsed.scheme != "file":
+            if parsed.scheme.lower() not in {"http", "https", "ssh", "git"}:
+                raise ValueError("unsupported Git remote URL scheme")
+            if not parsed.hostname or parsed.query or parsed.fragment:
+                raise ValueError("invalid Git remote URL")
+            host = parsed.hostname.lower()
+            port = parsed.port
+            authority = host if port is None else f"{host}:{port}"
+            path = self._normalized_repository_path(unquote(parsed.path))
+            transport = (
+                "secure" if parsed.scheme.lower() in {"https", "ssh"} else parsed.scheme.lower()
+            )
+            return f"{transport}:host:{authority}/{path}"
+
+        scp = SCP_REMOTE_RE.fullmatch(candidate)
+        if scp is not None:
+            host = scp.group("host").lower()
+            path = self._normalized_repository_path(scp.group("path"))
+            return f"secure:host:{host}/{path}"
+
+        raw_path = unquote(parsed.path) if parsed.scheme == "file" else candidate
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.repository / path
+        return "file:" + str(path.resolve())
+
+    @staticmethod
+    def _normalized_repository_path(value: str) -> str:
+        path = value.strip().strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if not path or any(part in {"", ".", ".."} for part in path.split("/")):
+            raise ValueError("invalid Git repository path")
+        return path
+
+    def candidate_tree(self, commit: str) -> str:
+        self.require_commit(commit)
+        return self._resolve(f"{commit}^{{tree}}")
+
+    def candidate_diff_digest(self, base_commit: str, commit: str) -> str:
+        self.require_ancestor(base_commit, commit)
+        result = self._git_bytes(
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            base_commit,
+            commit,
+            "--",
+        )
+        return "sha256:" + hashlib.sha256(result.stdout).hexdigest()
+
+    def candidate_merge_tree(
+        self, base_commit: str, trusted_main_commit: str, candidate_commit: str
+    ) -> str:
+        """Compute the candidate-on-main tree without changing refs or the object store."""
+        self.require_ancestor(base_commit, trusted_main_commit)
+        self.require_ancestor(base_commit, candidate_commit)
+        if trusted_main_commit == base_commit:
+            return self.candidate_tree(candidate_commit)
+        if trusted_main_commit == candidate_commit:
+            return self.candidate_tree(candidate_commit)
+
+        common = Path(str(self._git("rev-parse", "--git-common-dir").stdout).strip())
+        if not common.is_absolute():
+            common = (self.repository / common).resolve()
+        object_directory = common / "objects"
+        if not object_directory.is_dir():
+            raise GitVerificationError("Git common object directory is unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="merge-tree-") as directory:
+            quarantine = Path(directory) / "objects"
+            quarantine.mkdir()
+            result = self._git(
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                trusted_main_commit,
+                candidate_commit,
+                check=False,
+                extra_env={
+                    "GIT_OBJECT_DIRECTORY": str(quarantine),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(object_directory),
+                },
+            )
+            if result.returncode != 0:
+                raise GitVerificationError(
+                    "candidate does not merge cleanly with trusted main: "
+                    f"{str(result.stderr)[-2000:]}"
+                )
+            output = str(result.stdout).strip().splitlines()
+            tree = output[0] if output else ""
+            if not COMMIT_RE.fullmatch(tree):
+                raise GitVerificationError("git merge-tree did not return a tree SHA")
+            return tree
+
+    def changed_paths(self, base_commit: str, commit: str) -> tuple[str, ...]:
+        self.require_ancestor(base_commit, commit)
+        result = self._git_bytes(
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_commit,
+            commit,
+            "--",
+        )
+        try:
+            paths = tuple(
+                sorted(part.decode("utf-8") for part in result.stdout.split(b"\0") if part)
+            )
+        except UnicodeDecodeError as exc:
+            raise GitVerificationError("candidate contains a non-UTF-8 path") from exc
+        if any(
+            path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in Path(path).parts)
+            for path in paths
+        ):
+            raise GitVerificationError("candidate contains an invalid repository path")
+        return paths
 
     def refresh_trusted_main(self, remote: str = "origin", branch: str = "main") -> str:
         """Fetch a remote branch into the dedicated trusted ref and return its SHA."""
@@ -86,11 +307,44 @@ class RepositoryGitVerifier:
             raise GitVerificationError(f"Git did not resolve a full commit for {value}")
         return resolved
 
-    def _git(self, *arguments: str, check: bool = True):
+    def _git(
+        self,
+        *arguments: str,
+        check: bool = True,
+        extra_env: dict[str, str] | None = None,
+    ):
+        environment = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/nonexistent"),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        environment.update(extra_env or {})
         try:
             result = run_bounded(
                 ["git", "-C", str(self.repository), *arguments],
                 cwd=self.repository,
+                env=environment,
+                timeout_seconds=self.timeout_seconds,
+            )
+        except (RunnerError, RunnerTimeout) as exc:
+            raise GitVerificationError(f"Git verification could not run: {exc}") from exc
+        if check and result.returncode != 0:
+            raise GitVerificationError(
+                f"git {' '.join(arguments)} failed ({result.returncode}): "
+                f"{str(result.stderr)[-2000:]}"
+            )
+        return result
+
+    def _git_bytes(self, *arguments: str):
+        try:
+            result = run_bounded(
+                ["git", "-C", str(self.repository), *arguments],
+                cwd=self.repository,
+                text=False,
                 env={
                     "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                     "HOME": os.environ.get("HOME", "/nonexistent"),
@@ -104,9 +358,9 @@ class RepositoryGitVerifier:
             )
         except (RunnerError, RunnerTimeout) as exc:
             raise GitVerificationError(f"Git verification could not run: {exc}") from exc
-        if check and result.returncode != 0:
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace")
             raise GitVerificationError(
-                f"git {' '.join(arguments)} failed ({result.returncode}): "
-                f"{str(result.stderr)[-2000:]}"
+                f"git {' '.join(arguments)} failed ({result.returncode}): {detail[-2000:]}"
             )
         return result

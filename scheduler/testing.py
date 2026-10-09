@@ -30,6 +30,8 @@ class TestIdentity:
     command_digest: str
     environment_digest: str
     baseline_commit: str | None
+    trusted_main_commit: str | None
+    candidate_merge_tree: str | None
 
 
 class TestEvidenceStore:
@@ -45,6 +47,8 @@ class TestEvidenceStore:
         commands: list[str],
         environment: dict[str, str],
         baseline_commit: str | None = None,
+        trusted_main_commit: str | None = None,
+        candidate_merge_tree: str | None = None,
     ) -> TestIdentity:
         if level not in {1, 2, 3}:
             raise ValueError("test level must be 1, 2, or 3")
@@ -53,14 +57,36 @@ class TestEvidenceStore:
                 raise ValueError("revision and candidate must be sha256 digests")
         if level >= 2 and (baseline_commit is None or not COMMIT_RE.fullmatch(baseline_commit)):
             raise ValueError("Level 2/3 requires a full Python baseline commit")
+        if level == 3 and (
+            trusted_main_commit is None
+            or not COMMIT_RE.fullmatch(trusted_main_commit)
+            or candidate_merge_tree is None
+            or not COMMIT_RE.fullmatch(candidate_merge_tree)
+        ):
+            raise ValueError(
+                "Level 3 requires the trusted-main commit and candidate merge tree"
+            )
+        if level < 3 and (
+            trusted_main_commit is not None or candidate_merge_tree is not None
+        ):
+            raise ValueError("Level 1/2 cannot carry Level 3 merge bindings")
+        environment_identity: Any = environment
+        if level == 3:
+            environment_identity = {
+                "environment": environment,
+                "trusted_main_commit": trusted_main_commit,
+                "candidate_merge_tree": candidate_merge_tree,
+            }
         return TestIdentity(
             rfc_id=rfc_id,
             revision_digest=revision_digest,
             candidate_digest=candidate_digest,
             level=level,
             command_digest=digest_json(commands),
-            environment_digest=digest_json(environment),
+            environment_digest=digest_json(environment_identity),
             baseline_commit=baseline_commit,
+            trusted_main_commit=trusted_main_commit,
+            candidate_merge_tree=candidate_merge_tree,
         )
 
     def record(
@@ -109,6 +135,20 @@ class TestEvidenceStore:
             or not COMMIT_RE.fullmatch(identity.baseline_commit)
         ):
             raise ValueError("Level 2/3 requires a full Python baseline commit")
+        if identity.level == 3 and (
+            identity.trusted_main_commit is None
+            or not COMMIT_RE.fullmatch(identity.trusted_main_commit)
+            or identity.candidate_merge_tree is None
+            or not COMMIT_RE.fullmatch(identity.candidate_merge_tree)
+        ):
+            raise ValueError(
+                "Level 3 requires the trusted-main commit and candidate merge tree"
+            )
+        if identity.level < 3 and (
+            identity.trusted_main_commit is not None
+            or identity.candidate_merge_tree is not None
+        ):
+            raise ValueError("Level 1/2 cannot carry Level 3 merge bindings")
         expected = (
             ("RFC", expected_rfc_id, identity.rfc_id),
             ("revision", expected_revision_digest, identity.revision_digest),
@@ -175,7 +215,8 @@ class TestEvidenceStore:
             complete,
         )
         existing = connection.execute(
-            "SELECT status, evidence_digest FROM test_runs WHERE rfc_id = ? "
+            "SELECT status, evidence_digest, trusted_main_commit, candidate_merge_tree "
+            "FROM test_runs WHERE rfc_id = ? "
             "AND revision_digest = ? AND candidate_digest = ? AND level = ? "
             "AND command_digest = ? AND environment_digest = ? "
             "AND baseline_commit IS ?",
@@ -190,15 +231,26 @@ class TestEvidenceStore:
             ),
         ).fetchone()
         if existing:
-            if existing["status"] != status or existing["evidence_digest"] != evidence_digest:
+            if (
+                existing["status"] != status
+                or existing["evidence_digest"] != evidence_digest
+                or existing["trusted_main_commit"] != identity.trusted_main_commit
+                or existing["candidate_merge_tree"] != identity.candidate_merge_tree
+            ):
                 raise StateConflict("test identity already has different immutable evidence")
             return
         connection.execute(
             "INSERT INTO test_runs "
             "(rfc_id, revision_digest, candidate_digest, level, command_digest, "
-            "environment_digest, baseline_commit, status, evidence_digest, started_at, "
-            "completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            values,
+            "environment_digest, baseline_commit, trusted_main_commit, "
+            "candidate_merge_tree, status, evidence_digest, started_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                *values[:7],
+                identity.trusted_main_commit,
+                identity.candidate_merge_tree,
+                *values[7:],
+            ),
         )
 
     def reusable_pass(self, identity: TestIdentity) -> str | None:
@@ -207,7 +259,8 @@ class TestEvidenceStore:
                 "SELECT evidence_digest FROM test_runs WHERE rfc_id = ? "
                 "AND revision_digest = ? AND candidate_digest = ? AND level = ? "
                 "AND command_digest = ? AND environment_digest = ? "
-                "AND baseline_commit IS ? AND status = 'PASS'",
+                "AND baseline_commit IS ? AND trusted_main_commit IS ? "
+                "AND candidate_merge_tree IS ? AND status = 'PASS'",
                 (
                     identity.rfc_id,
                     identity.revision_digest,
@@ -216,6 +269,8 @@ class TestEvidenceStore:
                     identity.command_digest,
                     identity.environment_digest,
                     identity.baseline_commit,
+                    identity.trusted_main_commit,
+                    identity.candidate_merge_tree,
                 ),
             ).fetchone()
         return None if row is None else str(row["evidence_digest"])

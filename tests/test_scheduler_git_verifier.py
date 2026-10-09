@@ -24,6 +24,76 @@ def init_main(repo: Path) -> None:
 
 
 class GitVerifierTests(unittest.TestCase):
+    def test_candidate_verification_is_exact_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            init_main(repo)
+            (repo / "a").write_text("base\n")
+            git(repo, "add", "a")
+            git(
+                repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@invalid",
+                "commit",
+                "-m",
+                "base",
+            )
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-b", "agent/RFC-20261008-056")
+            (repo / "src").mkdir()
+            (repo / "src" / "provider.ts").write_text("export {};\n")
+            git(repo, "add", "src/provider.ts")
+            git(
+                repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@invalid",
+                "commit",
+                "-m",
+                "candidate",
+            )
+            candidate = git(repo, "rev-parse", "HEAD")
+            verifier = RepositoryGitVerifier(repo)
+            ref_name = "refs/heads/agent/RFC-20261008-056"
+
+            self.assertEqual(verifier.resolve_ref(ref_name), candidate)
+            verifier.require_exact_ref(ref_name, candidate)
+            self.assertEqual(
+                verifier.candidate_tree(candidate), git(repo, "rev-parse", "HEAD^{tree}")
+            )
+            self.assertRegex(verifier.candidate_diff_digest(base, candidate), r"^sha256:")
+            self.assertEqual(verifier.changed_paths(base, candidate), ("src/provider.ts",))
+            self.assertEqual(git(repo, "rev-parse", ref_name), candidate)
+
+            git(repo, "checkout", "main")
+            (repo / "a").write_text("new main\n")
+            git(repo, "add", "a")
+            git(
+                repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@invalid",
+                "commit",
+                "-m",
+                "advance main",
+            )
+            main = git(repo, "rev-parse", "HEAD")
+            objects_before = git(repo, "count-objects", "-v")
+            merge_tree = verifier.candidate_merge_tree(base, main, candidate)
+            objects_after = git(repo, "count-objects", "-v")
+            self.assertRegex(merge_tree, r"^[0-9a-f]{40}$")
+            self.assertEqual(objects_after, objects_before)
+
+            with self.assertRaisesRegex(GitVerificationError, "does not identify"):
+                verifier.require_exact_ref(ref_name, base)
+            with self.assertRaises(ValueError):
+                verifier.resolve_ref("main")
+
     def test_refresh_trusted_main_fetches_remote_branch_into_dedicated_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

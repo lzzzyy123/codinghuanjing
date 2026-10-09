@@ -169,12 +169,27 @@ class PipelineTests(unittest.TestCase):
                 reviewer, ReviewResult("PASS", "PASS", review_log), now=8
             )
             self.assertEqual(state.task(rfc["id"])["state"], "LeadReview")
+            approval_log = artifacts.put_text(
+                "project-lead-approval", "lead accepted exact candidate"
+            )
             with self.assertRaisesRegex(StateConflict, "independent PASS"):
                 pipeline.approve_for_integration(
-                    rfc["id"], "sha256:" + "d" * 64, "project-lead", available_at=8
+                    rfc["id"],
+                    "sha256:" + "d" * 64,
+                    "project-lead:mac-owner",
+                    approval_channel="mac-codex:local",
+                    approval_evidence_digest=approval_log,
+                    approval_attestation="hmac-sha256:" + "a" * 64,
+                    available_at=8,
                 )
             integration_job = pipeline.approve_for_integration(
-                rfc["id"], CANDIDATE, "project-lead", available_at=8
+                rfc["id"],
+                CANDIDATE,
+                "project-lead:mac-owner",
+                approval_channel="mac-codex:local",
+                approval_evidence_digest=approval_log,
+                approval_attestation="hmac-sha256:" + "a" * 64,
+                available_at=8,
             )
             self.assertIsInstance(integration_job, int)
             queue.register_agent("integrator-1", "integrator", "local", "pid:4", now=8)
@@ -189,6 +204,8 @@ class PipelineTests(unittest.TestCase):
                 ["bun test", "bun run differential:all"],
                 {},
                 "a" * 40,
+                "a" * 40,
+                TREE,
             )
             pipeline.complete_integration(integration, level3, level3_log, now=11)
             self.assertEqual(state.task(rfc["id"])["state"], "Done")

@@ -43,6 +43,28 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
 - Git commits and pushes pass through the single-writer broker. Reviewer input is a detached read-only snapshot.
 - Remote publication uses a durable pre-push journal and read-only ref reconciler; active-runner startup wiring, trusted-main fetch freshness, supervised test receipts, kernel process containment and verified UID/GID separation remain mandatory cutover blockers. Shadow mode does not claim them.
 - `Done` means Level 3 passed for the reviewed candidate. It does not mean merged. No component automatically merges main.
+- Merge authorization is an append-only, audit-only decision. It recomputes the
+  exact local RFC ref, commit tree, binary diff, ownership and candidate-bound
+  Coder/test/Reviewer/Project Lead/publication evidence. Ordinary modules may be
+  classified `AUTO_MERGE_ELIGIBLE`; protected control, security, credential,
+  permission, shared-resource and gate changes are classified
+  `NEEDS_HUMAN_APPROVAL`. Missing or stale evidence is `BLOCKED`. No merge
+  executor, production wiring, remote fetch, push, or GitHub API call is enabled.
+- Level 3 evidence is bound to the exact trusted-main commit and candidate tree.
+  Authorization also checks a configured Project Lead principal and approval
+  channel, immutable candidate-bound approval evidence, the fixed approved Python
+  baseline, the pinned remote repository identity, and the live remote branch.
+  An immutable eligibility row is historical evidence, never executable authority.
+  A future broker must reserve it with its authenticated identity, an idempotency
+  key, an expected-main compare-and-swap value, a bounded lease and a fencing token.
+  The reservation is consumed exactly once after full revalidation. Expired
+  reservations remain blocked until explicit abort/reconciliation, and every
+  reservation transition is append-only audit evidence. The actual forge merge
+  must use the same expected-main CAS and an exact candidate-head lease in one
+  atomic remote ref transaction. A dormant, explicitly invoked merge CAS primitive
+  now records its intent before the write and consumes authorization only after
+  remote reconciliation proves both refs. It is not wired to a service, runner,
+  scheduler queue, GitHub API or production configuration.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 
 ## Three Test Levels
