@@ -49,7 +49,9 @@ A post-review defect must be corrected on the original task branch.
 
 
 def coder_report() -> str:
-    return "\n\n".join(f"{heading}\nEvidence." for heading in watcher.CODER_REPORT_HEADINGS)
+    sections = [f"{watcher.CODER_REPORT_HEADINGS[0]}\nCompletion Status: READY_FOR_TESTS"]
+    sections.extend(f"{heading}\nEvidence." for heading in watcher.CODER_REPORT_HEADINGS[1:])
+    return "\n\n".join(sections)
 
 
 def passing_review() -> dict:

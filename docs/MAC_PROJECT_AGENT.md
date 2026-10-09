@@ -73,6 +73,12 @@ only through:
 tools/retry-coder.sh RFC-20261008-057
 ```
 
+`retry-coder` is fenced by a per-RFC lock and fails if the Worker owns the task. It reuses a
+checkpoint only when the effective RFC (including a pending Project Lead amendment), frontmatter
+commands, dependency request manifest, branch, base, HEAD, and workspace patch still match. Queue
+publication is transactional: a failed publish rolls status back to a retry-eligible state while
+retaining an auditable, monotonically sequenced failure event.
+
 The command fails closed unless the RFC is idle and its task ID, branch, base,
 HEAD, changed paths, raw output, patch, and workspace fingerprint still match
 the durable checkpoint. Retries are bounded and never reuse passing tests or
