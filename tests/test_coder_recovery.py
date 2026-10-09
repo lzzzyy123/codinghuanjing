@@ -1208,6 +1208,58 @@ class RetryCoderControlTests(unittest.TestCase):
             self.assertTrue((root / "todo" / "inbox" / f"{RFC_ID}.md").is_file())
             validate.assert_called_once()
 
+    def test_exhausted_coder_cycles_can_retry_only_from_a_valid_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "failure_kind": None,
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "FAIL",
+                    "tests_passed": False,
+                }
+            )
+            (report_dir / "status.json").write_text(json.dumps(state))
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "git", side_effect=self.git_result),
+                mock.patch.object(control, "validate_coder_checkpoint") as validate,
+            ):
+                control.retry_coder(RFC_ID)
+            updated = json.loads((report_dir / "status.json").read_text())
+            self.assertEqual(updated["status"], "coder_retry_queued")
+            self.assertEqual(
+                updated["coder_retry"]["failure_kind"], "CODER_CYCLES_EXHAUSTED"
+            )
+            validate.assert_called_once()
+
+    def test_exhausted_coder_cycles_without_checkpoint_are_not_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "failure_kind": None,
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "FAIL",
+                    "tests_passed": False,
+                }
+            )
+            state.pop("coder_checkpoint")
+            (report_dir / "status.json").write_text(json.dumps(state))
+            with (
+                mock.patch.object(control, "BASE", root),
+                self.assertRaises(SystemExit),
+            ):
+                control.retry_coder(RFC_ID)
+            self.assertFalse((root / "todo" / "inbox" / f"{RFC_ID}.md").exists())
+
     def test_input_change_retry_preserves_worktree_and_reruns_coder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
