@@ -17,6 +17,7 @@ from .testing import TestEvidenceStore, TestIdentity
 
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ATTESTATION_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 ROLES = {"coder", "tester", "reviewer", "integrator"}
 KINDS_BY_ROLE = {
     "coder": {"coding"},
@@ -721,6 +722,7 @@ class QueueStore:
         *,
         approval_channel: str,
         approval_evidence_digest: str,
+        approval_attestation: str,
         available_at: float | None = None,
         max_attempts: int = 3,
     ) -> int:
@@ -729,6 +731,8 @@ class QueueStore:
             raise ValueError("approval channel must be non-empty")
         if not DIGEST_RE.fullmatch(approval_evidence_digest):
             raise ValueError("approval evidence must be a sha256 digest")
+        if not ATTESTATION_RE.fullmatch(approval_attestation):
+            raise ValueError("approval attestation must be an HMAC-SHA256 value")
         timestamp = time.time() if available_at is None else available_at
         with self.store.transaction() as connection:
             approval_artifact = connection.execute(
@@ -766,7 +770,8 @@ class QueueStore:
             approval_id = connection.execute(
                 "INSERT INTO project_lead_approvals "
                 "(rfc_id, revision_digest, candidate_digest, review_run_id, actor, channel, "
-                "evidence_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "evidence_digest, attestation, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     rfc_id,
                     task["revision_digest"],
@@ -775,6 +780,7 @@ class QueueStore:
                     actor,
                     approval_channel,
                     approval_evidence_digest,
+                    approval_attestation,
                     utc_now(),
                 ),
             ).lastrowid
@@ -790,6 +796,7 @@ class QueueStore:
                     "review_run_id": int(review["review_run_id"]),
                     "approval_channel": approval_channel,
                     "approval_evidence_digest": approval_evidence_digest,
+                    "approval_attestation": approval_attestation,
                     "approval_id": int(approval_id),
                 },
             )

@@ -197,6 +197,7 @@ class Pipeline:
         *,
         approval_channel: str,
         approval_evidence_digest: str,
+        approval_attestation: str,
         available_at: float | None = None,
     ) -> int:
         if not DIGEST_RE.fullmatch(candidate_digest):
@@ -208,6 +209,7 @@ class Pipeline:
             f"integration:{rfc_id}:{candidate_digest}",
             approval_channel=approval_channel,
             approval_evidence_digest=approval_evidence_digest,
+            approval_attestation=approval_attestation,
             available_at=available_at,
         )
 

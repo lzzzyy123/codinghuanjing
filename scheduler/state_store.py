@@ -277,6 +277,7 @@ CREATE TABLE IF NOT EXISTS merge_authorization_reservations (
     reservation_key TEXT NOT NULL UNIQUE,
     decision_digest TEXT NOT NULL
         REFERENCES merge_authorization_decisions(decision_digest),
+    authorization_subject_digest TEXT NOT NULL,
     rfc_id TEXT NOT NULL,
     candidate_digest TEXT NOT NULL,
     holder_identity TEXT NOT NULL,
@@ -291,6 +292,10 @@ CREATE TABLE IF NOT EXISTS merge_authorization_reservations (
 CREATE UNIQUE INDEX IF NOT EXISTS merge_authorization_single_use_idx
     ON merge_authorization_reservations(decision_digest)
     WHERE state IN ('reserved', 'consumed');
+CREATE TABLE IF NOT EXISTS merge_authorization_subject_fences (
+    authorization_subject_digest TEXT PRIMARY KEY,
+    last_token INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS merge_authorization_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     reservation_id TEXT NOT NULL
@@ -313,6 +318,29 @@ BEFORE DELETE ON merge_authorization_events
 BEGIN
     SELECT RAISE(ABORT, 'merge authorization events are immutable');
 END;
+CREATE TABLE IF NOT EXISTS merge_execution_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL UNIQUE
+        REFERENCES merge_authorization_reservations(reservation_id),
+    fencing_token INTEGER NOT NULL,
+    repository_identity TEXT NOT NULL,
+    main_ref TEXT NOT NULL,
+    candidate_ref TEXT NOT NULL,
+    expected_main_commit TEXT NOT NULL,
+    expected_candidate_commit TEXT NOT NULL,
+    merge_target_commit TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('prepared', 'applied', 'failed', 'blocked')),
+    observed_main_commit TEXT,
+    observed_candidate_commit TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS merge_execution_attempts_no_delete
+BEFORE DELETE ON merge_execution_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'merge execution attempts are durable audit records');
+END;
 CREATE TABLE IF NOT EXISTS project_lead_approvals (
     approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
     rfc_id TEXT NOT NULL,
@@ -322,6 +350,7 @@ CREATE TABLE IF NOT EXISTS project_lead_approvals (
     actor TEXT NOT NULL,
     channel TEXT NOT NULL,
     evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
+    attestation TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(rfc_id, revision_digest, candidate_digest, review_run_id)
 );
@@ -394,6 +423,59 @@ class StateStore:
             connection.execute("ALTER TABLE test_runs ADD COLUMN trusted_main_commit TEXT")
         if "candidate_merge_tree" not in test_columns:
             connection.execute("ALTER TABLE test_runs ADD COLUMN candidate_merge_tree TEXT")
+        reservation_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(merge_authorization_reservations)"
+            )
+        }
+        if "authorization_subject_digest" not in reservation_columns:
+            connection.execute(
+                "ALTER TABLE merge_authorization_reservations "
+                "ADD COLUMN authorization_subject_digest TEXT"
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "merge_authorization_subject_single_use_idx "
+            "ON merge_authorization_reservations(authorization_subject_digest) "
+            "WHERE state IN ('reserved', 'consumed')"
+        )
+        approval_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(project_lead_approvals)")
+        }
+        if "attestation" not in approval_columns:
+            connection.execute(
+                "ALTER TABLE project_lead_approvals ADD COLUMN attestation TEXT"
+            )
+        legacy_authorizations = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM merge_authorization_reservations "
+                "WHERE state IN ('reserved', 'consumed') "
+                "AND authorization_subject_digest IS NULL"
+            ).fetchone()[0]
+        )
+        legacy_approvals = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM project_lead_approvals WHERE attestation IS NULL"
+            ).fetchone()[0]
+        )
+        if legacy_authorizations or legacy_approvals:
+            connection.execute(
+                "INSERT OR IGNORE INTO migration_blockers VALUES (?, ?, ?, ?, NULL)",
+                (
+                    "merge-authorization-v2-migration-required",
+                    "MERGE_AUTHORIZATION_MIGRATION_REQUIRED",
+                    json.dumps(
+                        {
+                            "legacy_active_authorizations": legacy_authorizations,
+                            "legacy_project_lead_approvals": legacy_approvals,
+                        },
+                        sort_keys=True,
+                    ),
+                    utc_now(),
+                ),
+            )
         job_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)")
         }

@@ -60,7 +60,11 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
   The reservation is consumed exactly once after full revalidation. Expired
   reservations remain blocked until explicit abort/reconciliation, and every
   reservation transition is append-only audit evidence. The actual forge merge
-  must use the same expected-main CAS. This repository still contains no executor.
+  must use the same expected-main CAS and an exact candidate-head lease in one
+  atomic remote ref transaction. A dormant, explicitly invoked merge CAS primitive
+  now records its intent before the write and consumes authorization only after
+  remote reconciliation proves both refs. It is not wired to a service, runner,
+  scheduler queue, GitHub API or production configuration.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 
 ## Three Test Levels

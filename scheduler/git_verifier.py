@@ -146,13 +146,16 @@ class RepositoryGitVerifier:
             port = parsed.port
             authority = host if port is None else f"{host}:{port}"
             path = self._normalized_repository_path(unquote(parsed.path))
-            return f"host:{authority}/{path}"
+            transport = (
+                "secure" if parsed.scheme.lower() in {"https", "ssh"} else parsed.scheme.lower()
+            )
+            return f"{transport}:host:{authority}/{path}"
 
         scp = SCP_REMOTE_RE.fullmatch(candidate)
         if scp is not None:
             host = scp.group("host").lower()
             path = self._normalized_repository_path(scp.group("path"))
-            return f"host:{host}/{path}"
+            return f"secure:host:{host}/{path}"
 
         raw_path = unquote(parsed.path) if parsed.scheme == "file" else candidate
         path = Path(raw_path).expanduser()

@@ -8,6 +8,7 @@ operator-controlled merge step.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -15,9 +16,10 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from .git_verifier import GitVerificationError, RepositoryGitVerifier
+from .merge_cas import AtomicMergeCas
 from .models import TaskState
 from .registry import Registry, RfcRevision
 from .state_store import StateConflict, StateStore, utc_now
@@ -33,6 +35,7 @@ APPROVAL_CHANNEL_RE = re.compile(
 )
 MERGE_BROKER_RE = re.compile(r"^merge-broker:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RESERVATION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+ATTESTATION_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 
 AUTO_MERGE_ELIGIBLE = "AUTO_MERGE_ELIGIBLE"
 NEEDS_HUMAN_APPROVAL = "NEEDS_HUMAN_APPROVAL"
@@ -66,7 +69,6 @@ SENSITIVE_PREFIXES = (
     "service/",
     "templates/",
     "tests/final/",
-    "tests/differential/",
     "tests/integration/",
     "tests/parity/",
     "tests/regression/",
@@ -85,6 +87,8 @@ SENSITIVE_COMPONENTS = frozenset(
         "permission",
         "permissions",
         "policy",
+        "token",
+        "tokens",
         "secret",
         "secrets",
         "security",
@@ -92,6 +96,38 @@ SENSITIVE_COMPONENTS = frozenset(
 )
 SENSITIVE_GATE_COMPONENTS = frozenset(
     {"baseline", "baselines", "differential", "gate", "gates", "parity"}
+)
+DIFFERENTIAL_INFRA_COMPONENTS = frozenset(
+    {
+        "fixture",
+        "fixtures",
+        "framework",
+        "golden",
+        "goldens",
+        "harness",
+        "infrastructure",
+        "oracle",
+        "oracles",
+    }
+)
+CREDENTIAL_BASENAMES = frozenset(
+    {
+        ".env",
+        ".netrc",
+        ".npmrc",
+        "authorized_keys",
+        "credentials",
+        "credentials.json",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+        "known_hosts",
+        "secrets.json",
+        "ssh_config",
+        "token",
+        "tokens.json",
+    }
 )
 MAX_RESERVATION_LEASE_SECONDS = 3600
 
@@ -120,11 +156,41 @@ class TrustedApprovalPrincipal:
     channel: str
 
 
+def sign_project_lead_attestation(
+    key: bytes,
+    *,
+    rfc_id: str,
+    revision_digest: str,
+    candidate_digest: str,
+    review_run_id: int,
+    actor: str,
+    channel: str,
+    evidence_digest: str,
+) -> str:
+    """Sign an exact Project Lead approval without persisting its secret key."""
+    if not isinstance(key, bytes) or len(key) < 32:
+        raise ValueError("Project Lead attestation key must contain at least 32 bytes")
+    payload = {
+        "actor": actor,
+        "candidate_digest": candidate_digest,
+        "channel": channel,
+        "evidence_digest": evidence_digest,
+        "review_run_id": review_run_id,
+        "revision_digest": revision_digest,
+        "rfc_id": rfc_id,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return "hmac-sha256:" + hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
+
 @dataclass(frozen=True)
 class MergeAuthorizationReservation:
     reservation_id: str
     reservation_key: str
     decision_digest: str
+    authorization_subject_digest: str
     rfc_id: str
     candidate_digest: str
     holder_identity: str
@@ -146,10 +212,14 @@ class MergeAuthorizationGate:
         git_verifier: RepositoryGitVerifier,
         *,
         project_lead_principals: frozenset[TrustedApprovalPrincipal] = frozenset(),
+        project_lead_attestation_keys: Mapping[TrustedApprovalPrincipal, bytes]
+        | None = None,
         trusted_publication_remote: str = "origin",
         trusted_remote_url: str | None = None,
         trusted_main_branch: str = "main",
         approved_baseline_commit: str | None = None,
+        clock: Callable[[], float] = time.time,
+        merge_cas: AtomicMergeCas | None = None,
     ) -> None:
         if not project_lead_principals:
             raise ValueError("at least one trusted Project Lead principal is required")
@@ -160,6 +230,16 @@ class MergeAuthorizationGate:
                 or not APPROVAL_CHANNEL_RE.fullmatch(principal.channel)
             ):
                 raise ValueError("invalid trusted Project Lead principal")
+        attestation_keys = dict(project_lead_attestation_keys or {})
+        if set(attestation_keys) != set(project_lead_principals):
+            raise ValueError(
+                "every trusted Project Lead principal requires exactly one attestation key"
+            )
+        if any(
+            not isinstance(key, bytes) or len(key) < 32
+            for key in attestation_keys.values()
+        ):
+            raise ValueError("Project Lead attestation keys must contain at least 32 bytes")
         if not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", trusted_publication_remote
         ):
@@ -176,16 +256,26 @@ class MergeAuthorizationGate:
             raise ValueError("an approved full Python baseline commit is required")
         if trusted_remote_url is None:
             raise ValueError("a pinned trusted remote URL is required")
+        if not callable(clock):
+            raise ValueError("clock must be callable")
         self.registry = registry
         self.store = store
         self.git_verifier = git_verifier
         self.project_lead_principals = frozenset(project_lead_principals)
+        self.project_lead_attestation_keys = attestation_keys
         self.trusted_publication_remote = trusted_publication_remote
         self.trusted_repository_identity = git_verifier.normalize_remote_identity(
             trusted_remote_url
         )
         self.trusted_main_branch = trusted_main_branch
         self.approved_baseline_commit = approved_baseline_commit
+        self.clock = clock
+        if (
+            merge_cas is not None
+            and merge_cas.repository_identity != self.trusted_repository_identity
+        ):
+            raise ValueError("merge CAS repository identity does not match trusted remote")
+        self.merge_cas = merge_cas
 
     def evaluate(
         self, rfc_id: str, candidate_digest: str, requested_by: str
@@ -437,17 +527,26 @@ class MergeAuthorizationGate:
                 rfc.revision_digest,
                 candidate_digest,
                 self.project_lead_principals,
+                self.project_lead_attestation_keys,
             )
             review = None
             if approval is None:
                 block("Project Lead approval is missing for the exact candidate")
             else:
-                review_id, actor, channel, approval_evidence, sequence = approval
+                (
+                    review_id,
+                    actor,
+                    channel,
+                    approval_evidence,
+                    approval_attestation,
+                    sequence,
+                ) = approval
                 evidence.update(
                     {
                         "project_lead_actor": actor,
                         "project_lead_channel": channel,
                         "project_lead_approval_evidence": approval_evidence,
+                        "project_lead_approval_attestation": approval_attestation,
                         "project_lead_transition_sequence": sequence,
                         "review_run_id": review_id,
                     }
@@ -661,14 +760,14 @@ class MergeAuthorizationGate:
         expected_trusted_main_commit: str,
         *,
         lease_seconds: float = 300,
-        now: float | None = None,
     ) -> MergeAuthorizationReservation:
         """Reserve one decision for a single fenced future merge attempt."""
         self._validate_reservation_identity(reservation_key, holder_identity, lease_seconds)
         current = self._require_current_eligibility(
             decision_digest, expected_trusted_main_commit
         )
-        timestamp = time.time() if now is None else now
+        subject_digest = self._authorization_subject_digest(current)
+        timestamp = self._clock_now()
         now_text = utc_now()
         with self.store.transaction() as connection:
             existing_key = connection.execute(
@@ -678,6 +777,7 @@ class MergeAuthorizationGate:
             if existing_key is not None:
                 if (
                     existing_key["decision_digest"] == decision_digest
+                    and existing_key["authorization_subject_digest"] == subject_digest
                     and existing_key["holder_identity"] == holder_identity
                     and existing_key["expected_trusted_main_commit"]
                     == expected_trusted_main_commit
@@ -689,8 +789,9 @@ class MergeAuthorizationGate:
 
             active = connection.execute(
                 "SELECT state, expires_at FROM merge_authorization_reservations "
-                "WHERE decision_digest = ? AND state IN ('reserved', 'consumed')",
-                (decision_digest,),
+                "WHERE authorization_subject_digest = ? "
+                "AND state IN ('reserved', 'consumed')",
+                (subject_digest,),
             ).fetchone()
             if active is not None:
                 suffix = (
@@ -704,16 +805,16 @@ class MergeAuthorizationGate:
                 )
 
             connection.execute(
-                "INSERT INTO merge_authorization_fences VALUES (?, 1) "
-                "ON CONFLICT(decision_digest) DO UPDATE "
+                "INSERT INTO merge_authorization_subject_fences VALUES (?, 1) "
+                "ON CONFLICT(authorization_subject_digest) DO UPDATE "
                 "SET last_token = last_token + 1",
-                (decision_digest,),
+                (subject_digest,),
             )
             fencing_token = int(
                 connection.execute(
-                    "SELECT last_token FROM merge_authorization_fences "
-                    "WHERE decision_digest = ?",
-                    (decision_digest,),
+                    "SELECT last_token FROM merge_authorization_subject_fences "
+                    "WHERE authorization_subject_digest = ?",
+                    (subject_digest,),
                 ).fetchone()["last_token"]
             )
             reservation_id = str(uuid.uuid4())
@@ -721,14 +822,16 @@ class MergeAuthorizationGate:
             try:
                 connection.execute(
                     "INSERT INTO merge_authorization_reservations "
-                    "(reservation_id, reservation_key, decision_digest, rfc_id, "
+                    "(reservation_id, reservation_key, decision_digest, "
+                    "authorization_subject_digest, rfc_id, "
                     "candidate_digest, holder_identity, expected_trusted_main_commit, "
                     "fencing_token, state, expires_at, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)",
                     (
                         reservation_id,
                         reservation_key,
                         decision_digest,
+                        subject_digest,
                         current.rfc_id,
                         current.candidate_digest,
                         holder_identity,
@@ -766,10 +869,9 @@ class MergeAuthorizationGate:
         fencing_token: int,
         *,
         lease_seconds: float = 300,
-        now: float | None = None,
     ) -> MergeAuthorizationReservation:
         self._validate_reservation_identity("renewal", holder_identity, lease_seconds)
-        timestamp = time.time() if now is None else now
+        timestamp = self._clock_now()
         with self.store.transaction() as connection:
             row = self._locked_reservation(
                 connection, reservation_id, holder_identity, fencing_token
@@ -812,53 +914,339 @@ class MergeAuthorizationGate:
         holder_identity: str,
         fencing_token: int,
         expected_trusted_main_commit: str,
-        *,
-        now: float | None = None,
+        merge_target_commit: str,
     ) -> MergeAuthorizationReservation:
-        """Consume exactly once after revalidation; this method performs no Git write."""
-        timestamp = time.time() if now is None else now
+        """Consume only as the outcome of the configured atomic remote merge CAS."""
         with self.store.connect() as connection:
             initial = self._locked_reservation(
                 connection, reservation_id, holder_identity, fencing_token
             )
         if initial["expected_trusted_main_commit"] != expected_trusted_main_commit:
             raise StateConflict("reservation trusted-main CAS input does not match")
-        self._require_current_eligibility(
-            str(initial["decision_digest"]), expected_trusted_main_commit
+        return self.execute_reserved_merge(
+            reservation_id,
+            holder_identity,
+            fencing_token,
+            merge_target_commit,
         )
-        with self.store.transaction() as connection:
-            row = self._locked_reservation(
+
+    def execute_reserved_merge(
+        self,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+        merge_target_commit: str,
+    ) -> MergeAuthorizationReservation:
+        """Execute one recoverable atomic remote CAS; production wiring is absent."""
+        if not COMMIT_RE.fullmatch(merge_target_commit):
+            raise ValueError("merge target must be a full Git SHA")
+        if self.merge_cas is None:
+            raise StateConflict("merge CAS executor is not configured")
+        merge_cas = self.merge_cas
+        with self.store.connect() as connection:
+            initial = self._locked_reservation(
                 connection, reservation_id, holder_identity, fencing_token
             )
-            if row["state"] != "reserved" or float(row["expires_at"]) <= timestamp:
-                raise StateConflict("reservation is not live and consumable")
-            updated = connection.execute(
-                "UPDATE merge_authorization_reservations SET state = 'consumed', "
-                "updated_at = ? WHERE reservation_id = ? AND holder_identity = ? "
-                "AND fencing_token = ? AND state = 'reserved' AND expires_at > ?",
-                (
-                    utc_now(),
+            existing_attempt = connection.execute(
+                "SELECT attempt_id, state FROM merge_execution_attempts "
+                "WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        if existing_attempt is not None and existing_attempt["state"] != "failed":
+            return self.reconcile_reserved_merge(
+                reservation_id, holder_identity, fencing_token
+            )
+        if initial["state"] != "reserved":
+            raise StateConflict("only a reserved authorization can execute a merge CAS")
+        expected_main = str(initial["expected_trusted_main_commit"])
+        decision = self._require_current_eligibility(
+            str(initial["decision_digest"]), expected_main
+        )
+        if decision.candidate_commit is None or decision.head_ref is None:
+            raise StateConflict("authorization decision has no candidate Git binding")
+        if merge_cas.repository_identity != self.trusted_repository_identity:
+            raise StateConflict("merge CAS repository identity does not match authorization")
+        if float(initial["expires_at"]) - self._clock_now() <= float(
+            merge_cas.maximum_duration_seconds
+        ):
+            raise StateConflict("reservation lease cannot cover the bounded merge CAS")
+        try:
+            self.git_verifier.require_ancestor(
+                expected_main, merge_target_commit
+            )
+            self.git_verifier.require_ancestor(
+                decision.candidate_commit, merge_target_commit
+            )
+            target_tree = self.git_verifier.candidate_tree(merge_target_commit)
+        except (GitVerificationError, ValueError) as exc:
+            raise StateConflict(f"merge target is not candidate-bound: {exc}") from exc
+        if target_tree != decision.evidence.get("candidate_merge_tree"):
+            raise StateConflict("merge target tree differs from Level 3 reviewed tree")
+
+        main_ref = f"refs/heads/{self.trusted_main_branch}"
+        attempt_id = self._prepare_merge_attempt(
+            initial,
+            merge_cas.repository_identity,
+            main_ref,
+            decision.head_ref,
+            decision.candidate_commit,
+            merge_target_commit,
+        )
+        # Git ancestry checks and intent persistence can be slow. Re-read the
+        # trusted clock at the last boundary before the bounded remote CAS.
+        if float(initial["expires_at"]) - self._clock_now() <= float(
+            merge_cas.maximum_duration_seconds
+        ):
+            self._record_merge_attempt_error(attempt_id, "LEASE_WINDOW_EXHAUSTED")
+            raise StateConflict("reservation lease cannot cover the bounded merge CAS")
+        try:
+            merge_cas.compare_and_swap(
+                reservation_id=reservation_id,
+                fencing_token=fencing_token,
+                expected_main_commit=expected_main,
+                main_ref=main_ref,
+                expected_candidate_commit=decision.candidate_commit,
+                candidate_ref=decision.head_ref,
+                merge_target_commit=merge_target_commit,
+            )
+        except Exception:
+            self._record_merge_attempt_error(attempt_id, "CAS_CALL_FAILED")
+            raise
+        return self.reconcile_reserved_merge(
+            reservation_id,
+            holder_identity,
+            fencing_token,
+        )
+
+    def reconcile_reserved_merge(
+        self,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+    ) -> MergeAuthorizationReservation:
+        """Recover after CAS success/failure by trusting remote refs, not process outcome."""
+        if self.merge_cas is None:
+            raise StateConflict("merge CAS executor is not configured")
+        merge_cas = self.merge_cas
+        with self.store.connect() as connection:
+            reservation = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
+            attempt = connection.execute(
+                "SELECT * FROM merge_execution_attempts WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        if attempt is None:
+            raise StateConflict("merge execution attempt does not exist")
+        if attempt["repository_identity"] != merge_cas.repository_identity:
+            raise StateConflict("merge CAS repository identity changed during recovery")
+        observed_main = self.git_verifier.resolve_pinned_remote_head(
+            self.trusted_publication_remote,
+            self.trusted_repository_identity,
+            str(attempt["main_ref"]),
+        )
+        observed_candidate = self.git_verifier.resolve_pinned_remote_head(
+            self.trusted_publication_remote,
+            self.trusted_repository_identity,
+            str(attempt["candidate_ref"]),
+        )
+        if (
+            observed_main == attempt["merge_target_commit"]
+            and observed_candidate == attempt["expected_candidate_commit"]
+        ):
+            with self.store.transaction() as connection:
+                current = self._locked_reservation(
+                    connection, reservation_id, holder_identity, fencing_token
+                )
+                if current["state"] == "consumed":
+                    return self._reservation(current)
+                if current["state"] != "reserved":
+                    raise StateConflict("merge CAS succeeded for a non-reserved authorization")
+                updated = connection.execute(
+                    "UPDATE merge_authorization_reservations SET state = 'consumed', "
+                    "updated_at = ? WHERE reservation_id = ? AND holder_identity = ? "
+                    "AND fencing_token = ? AND state = 'reserved'",
+                    (utc_now(), reservation_id, holder_identity, fencing_token),
+                )
+                if updated.rowcount != 1:
+                    raise StateConflict("reservation changed during merge CAS reconciliation")
+                connection.execute(
+                    "UPDATE merge_execution_attempts SET state = 'applied', "
+                    "observed_main_commit = ?, observed_candidate_commit = ?, "
+                    "error_code = NULL, updated_at = ? WHERE attempt_id = ?",
+                    (observed_main, observed_candidate, utc_now(), attempt["attempt_id"]),
+                )
+                self._append_reservation_event(
+                    connection,
                     reservation_id,
-                    holder_identity,
+                    "MERGED",
                     fencing_token,
-                    timestamp,
+                    holder_identity,
+                    {
+                        "attempt_id": int(attempt["attempt_id"]),
+                        "merge_target_commit": str(attempt["merge_target_commit"]),
+                    },
+                )
+                row = connection.execute(
+                    "SELECT * FROM merge_authorization_reservations "
+                    "WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+            return self._reservation(row)
+
+        unchanged = (
+            observed_main == attempt["expected_main_commit"]
+            and observed_candidate == attempt["expected_candidate_commit"]
+        )
+        with self.store.transaction() as connection:
+            connection.execute(
+                "UPDATE merge_execution_attempts SET state = ?, observed_main_commit = ?, "
+                "observed_candidate_commit = ?, error_code = ?, updated_at = ? "
+                "WHERE attempt_id = ?",
+                (
+                    "failed" if unchanged else "blocked",
+                    observed_main,
+                    observed_candidate,
+                    "CAS_NOT_APPLIED" if unchanged else "REMOTE_REF_DIVERGED",
+                    utc_now(),
+                    attempt["attempt_id"],
                 ),
             )
-            if updated.rowcount != 1:
-                raise StateConflict("reservation changed during consumption")
+            current = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
             self._append_reservation_event(
                 connection,
                 reservation_id,
-                "CONSUMED",
+                "MERGE_FAILED" if unchanged else "MERGE_BLOCKED",
                 fencing_token,
                 holder_identity,
-                {"expected_trusted_main_commit": expected_trusted_main_commit},
+                {
+                    "attempt_id": int(attempt["attempt_id"]),
+                    "observed_candidate_commit": observed_candidate,
+                    "observed_main_commit": observed_main,
+                },
             )
-            consumed = connection.execute(
-                "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
-                (reservation_id,),
+        raise StateConflict(
+            "atomic merge CAS was not applied"
+            if unchanged
+            else "remote refs diverged during merge CAS; manual recovery is required"
+        )
+
+    def _prepare_merge_attempt(
+        self,
+        reservation,
+        repository_identity: str,
+        main_ref: str,
+        candidate_ref: str,
+        expected_candidate_commit: str,
+        merge_target_commit: str,
+    ) -> int:
+        values = (
+            int(reservation["fencing_token"]),
+            repository_identity,
+            main_ref,
+            candidate_ref,
+            str(reservation["expected_trusted_main_commit"]),
+            expected_candidate_commit,
+            merge_target_commit,
+        )
+        with self.store.transaction() as connection:
+            current = self._locked_reservation(
+                connection,
+                str(reservation["reservation_id"]),
+                str(reservation["holder_identity"]),
+                int(reservation["fencing_token"]),
+            )
+            if current["state"] != "reserved":
+                raise StateConflict("merge execution requires a reserved authorization")
+            existing = connection.execute(
+                "SELECT * FROM merge_execution_attempts WHERE reservation_id = ?",
+                (reservation["reservation_id"],),
             ).fetchone()
-        return self._reservation(consumed)
+            if existing is not None:
+                existing_values = tuple(
+                    existing[name]
+                    for name in (
+                        "fencing_token",
+                        "repository_identity",
+                        "main_ref",
+                        "candidate_ref",
+                        "expected_main_commit",
+                        "expected_candidate_commit",
+                        "merge_target_commit",
+                    )
+                )
+                if existing_values != values:
+                    raise StateConflict("merge execution attempt identity cannot change")
+                if existing["state"] == "failed":
+                    connection.execute(
+                        "UPDATE merge_execution_attempts SET state = 'prepared', "
+                        "error_code = NULL, updated_at = ? WHERE attempt_id = ?",
+                        (utc_now(), existing["attempt_id"]),
+                    )
+                    self._append_reservation_event(
+                        connection,
+                        str(reservation["reservation_id"]),
+                        "MERGE_RETRY",
+                        int(reservation["fencing_token"]),
+                        str(reservation["holder_identity"]),
+                        {"attempt_id": int(existing["attempt_id"])},
+                    )
+                return int(existing["attempt_id"])
+            now_text = utc_now()
+            attempt_id = connection.execute(
+                "INSERT INTO merge_execution_attempts "
+                "(reservation_id, fencing_token, repository_identity, main_ref, "
+                "candidate_ref, expected_main_commit, expected_candidate_commit, "
+                "merge_target_commit, state, observed_main_commit, "
+                "observed_candidate_commit, error_code, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', NULL, NULL, NULL, ?, ?)",
+                (reservation["reservation_id"], *values, now_text, now_text),
+            ).lastrowid
+            self._append_reservation_event(
+                connection,
+                str(reservation["reservation_id"]),
+                "MERGE_PREPARED",
+                int(reservation["fencing_token"]),
+                str(reservation["holder_identity"]),
+                {
+                    "attempt_id": int(attempt_id),
+                    "expected_candidate_commit": expected_candidate_commit,
+                    "expected_main_commit": str(
+                        reservation["expected_trusted_main_commit"]
+                    ),
+                    "merge_target_commit": merge_target_commit,
+                },
+            )
+        return int(attempt_id)
+
+    def _record_merge_attempt_error(self, attempt_id: int, error_code: str) -> None:
+        with self.store.transaction() as connection:
+            updated = connection.execute(
+                "UPDATE merge_execution_attempts SET error_code = ?, updated_at = ? "
+                "WHERE attempt_id = ? AND state IN ('prepared', 'failed')",
+                (error_code, utc_now(), attempt_id),
+            )
+            if updated.rowcount == 1:
+                attempt = connection.execute(
+                    "SELECT reservation_id, fencing_token FROM merge_execution_attempts "
+                    "WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                reservation = connection.execute(
+                    "SELECT holder_identity FROM merge_authorization_reservations "
+                    "WHERE reservation_id = ?",
+                    (attempt["reservation_id"],),
+                ).fetchone()
+                self._append_reservation_event(
+                    connection,
+                    str(attempt["reservation_id"]),
+                    "MERGE_ERROR",
+                    int(attempt["fencing_token"]),
+                    str(reservation["holder_identity"]),
+                    {"attempt_id": attempt_id, "error_code": error_code},
+                )
 
     def abort_reservation(
         self,
@@ -875,6 +1263,14 @@ class MergeAuthorizationGate:
             )
             if row["state"] != "reserved":
                 raise StateConflict("only a reserved authorization can be aborted")
+            attempt = connection.execute(
+                "SELECT state FROM merge_execution_attempts WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if attempt is not None and attempt["state"] != "failed":
+                raise StateConflict(
+                    "merge attempt must be reconciled as unchanged before abort"
+                )
             updated = connection.execute(
                 "UPDATE merge_authorization_reservations SET state = 'aborted', "
                 "updated_at = ? WHERE reservation_id = ? AND holder_identity = ? "
@@ -960,7 +1356,18 @@ class MergeAuthorizationGate:
         actor: str,
         payload: dict[str, Any],
     ) -> None:
-        if event_type not in {"RESERVED", "RENEWED", "CONSUMED", "ABORTED"}:
+        if event_type not in {
+            "RESERVED",
+            "RENEWED",
+            "CONSUMED",
+            "ABORTED",
+            "MERGE_PREPARED",
+            "MERGE_ERROR",
+            "MERGE_FAILED",
+            "MERGE_BLOCKED",
+            "MERGE_RETRY",
+            "MERGED",
+        }:
             raise ValueError("invalid merge authorization event type")
         connection.execute(
             "INSERT INTO merge_authorization_events "
@@ -984,6 +1391,7 @@ class MergeAuthorizationGate:
             reservation_id=str(row["reservation_id"]),
             reservation_key=str(row["reservation_key"]),
             decision_digest=str(row["decision_digest"]),
+            authorization_subject_digest=str(row["authorization_subject_digest"]),
             rfc_id=str(row["rfc_id"]),
             candidate_digest=str(row["candidate_digest"]),
             holder_identity=str(row["holder_identity"]),
@@ -994,6 +1402,40 @@ class MergeAuthorizationGate:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    def _clock_now(self) -> float:
+        value = self.clock()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise StateConflict("trusted merge authorization clock returned invalid time")
+        return float(value)
+
+    @classmethod
+    def _authorization_subject_digest(
+        cls, decision: MergeAuthorizationDecision
+    ) -> str:
+        evidence = decision.evidence
+        subject = {
+            "candidate_commit": decision.candidate_commit,
+            "candidate_digest": decision.candidate_digest,
+            "revision_digest": decision.revision_digest,
+            "rfc_id": decision.rfc_id,
+            "trusted_main_commit": evidence.get("trusted_main_commit"),
+            "trusted_remote_main_commit": evidence.get("trusted_remote_main_commit"),
+            "trusted_repository_identity": evidence.get("trusted_repository_identity"),
+        }
+        if (
+            not COMMIT_RE.fullmatch(str(subject["candidate_commit"]))
+            or not COMMIT_RE.fullmatch(str(subject["trusted_main_commit"]))
+            or subject["trusted_remote_main_commit"] != subject["trusted_main_commit"]
+            or not isinstance(subject["trusted_repository_identity"], str)
+            or not subject["trusted_repository_identity"]
+        ):
+            raise StateConflict("authorization decision has an incomplete subject binding")
+        return cls._digest(subject)
 
     def history(self, rfc_id: str) -> tuple[MergeAuthorizationDecision, ...]:
         with self.store.connect() as connection:
@@ -1148,11 +1590,41 @@ class MergeAuthorizationGate:
                 reasons.add(f"protected control or gate path: {path}")
             if components.intersection(SENSITIVE_COMPONENTS):
                 reasons.add(f"security, permission, or credential path: {path}")
-            if components.intersection(SENSITIVE_GATE_COMPONENTS) or any(
-                token in lowered for token in SENSITIVE_GATE_COMPONENTS
-            ):
+            if self._credential_bearing_path(lowered, components, basename):
+                reasons.add(f"credential-bearing path: {path}")
+            gate_semantics = components.intersection(SENSITIVE_GATE_COMPONENTS) or {
+                token for token in SENSITIVE_GATE_COMPONENTS if token in lowered
+            }
+            ordinary_differential_test = (
+                lowered.startswith("tests/differential/")
+                and gate_semantics <= {"differential"}
+                and not components.intersection(DIFFERENTIAL_INFRA_COMPONENTS)
+            )
+            if gate_semantics and not ordinary_differential_test:
                 reasons.add(f"parity, differential, baseline, or test gate path: {path}")
         return reasons
+
+    @staticmethod
+    def _credential_bearing_path(
+        lowered: str, components: set[str], basename: str
+    ) -> bool:
+        path_parts = set(lowered.split("/"))
+        return (
+            basename in CREDENTIAL_BASENAMES
+            or basename.startswith(".env.")
+            or basename.endswith((".key", ".pem", ".p12", ".pfx"))
+            or ".ssh" in path_parts
+            or "ssh" in components
+            or "sshd" in components
+            or ".aws" in path_parts
+            or ".kube" in path_parts
+            or ".docker" in path_parts
+            or bool(
+                components.intersection(
+                    {"credential", "credentials", "secret", "secrets", "token", "tokens"}
+                )
+            )
+        )
 
     def _revision_risk_reasons(self, connection, rfc: RfcRevision, block) -> set[str]:
         if rfc.revision == 1:
@@ -1230,6 +1702,7 @@ class MergeAuthorizationGate:
         revision_digest,
         candidate_digest,
         trusted_principals: frozenset[TrustedApprovalPrincipal],
+        attestation_keys: Mapping[TrustedApprovalPrincipal, bytes],
     ):
         rows = connection.execute(
             "SELECT sequence, actor, metadata_json FROM transitions WHERE rfc_id = ? "
@@ -1248,6 +1721,7 @@ class MergeAuthorizationGate:
                 review_id = metadata.get("review_run_id")
                 channel = metadata.get("approval_channel")
                 approval_evidence = metadata.get("approval_evidence_digest")
+                approval_attestation = metadata.get("approval_attestation")
                 approval_id = metadata.get("approval_id")
             except (TypeError, json.JSONDecodeError, AttributeError):
                 continue
@@ -1259,6 +1733,8 @@ class MergeAuthorizationGate:
                 or isinstance(approval_id, bool)
                 or not isinstance(channel, str)
                 or not isinstance(approval_evidence, str)
+                or not isinstance(approval_attestation, str)
+                or not ATTESTATION_RE.fullmatch(approval_attestation)
             ):
                 continue
             approval_record = connection.execute(
@@ -1266,7 +1742,7 @@ class MergeAuthorizationGate:
                 "ON artifacts.digest = project_lead_approvals.evidence_digest "
                 "WHERE approval_id = ? AND rfc_id = ? AND revision_digest = ? "
                 "AND candidate_digest = ? AND review_run_id = ? AND actor = ? "
-                "AND channel = ? AND evidence_digest = ? "
+                "AND channel = ? AND evidence_digest = ? AND attestation = ? "
                 "AND artifacts.kind = 'project-lead-approval'",
                 (
                     approval_id,
@@ -1277,14 +1753,40 @@ class MergeAuthorizationGate:
                     actor,
                     channel,
                     approval_evidence,
+                    approval_attestation,
                 ),
             ).fetchone()
+            principal = TrustedApprovalPrincipal(actor, channel)
+            key = attestation_keys.get(principal)
+            expected_attestation = (
+                sign_project_lead_attestation(
+                    key,
+                    rfc_id=rfc_id,
+                    revision_digest=revision_digest,
+                    candidate_digest=candidate_digest,
+                    review_run_id=review_id,
+                    actor=actor,
+                    channel=channel,
+                    evidence_digest=approval_evidence,
+                )
+                if key is not None
+                else None
+            )
             if (
                 metadata.get("candidate_digest") == candidate_digest
-                and TrustedApprovalPrincipal(actor, channel) in trusted_principals
+                and principal in trusted_principals
                 and approval_record is not None
+                and expected_attestation is not None
+                and hmac.compare_digest(approval_attestation, expected_attestation)
             ):
-                return review_id, actor, channel, approval_evidence, int(row["sequence"])
+                return (
+                    review_id,
+                    actor,
+                    channel,
+                    approval_evidence,
+                    approval_attestation,
+                    int(row["sequence"]),
+                )
         return None
 
     @staticmethod

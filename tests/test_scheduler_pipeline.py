@@ -179,6 +179,7 @@ class PipelineTests(unittest.TestCase):
                     "project-lead:mac-owner",
                     approval_channel="mac-codex:local",
                     approval_evidence_digest=approval_log,
+                    approval_attestation="hmac-sha256:" + "a" * 64,
                     available_at=8,
                 )
             integration_job = pipeline.approve_for_integration(
@@ -187,6 +188,7 @@ class PipelineTests(unittest.TestCase):
                 "project-lead:mac-owner",
                 approval_channel="mac-codex:local",
                 approval_evidence_digest=approval_log,
+                approval_attestation="hmac-sha256:" + "a" * 64,
                 available_at=8,
             )
             self.assertIsInstance(integration_job, int)

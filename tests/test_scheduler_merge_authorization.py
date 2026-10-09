@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import inspect
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from dataclasses import dataclass
@@ -15,12 +17,14 @@ from scheduler.evidence import ArtifactStore
 from scheduler.git_broker import Candidate
 from scheduler.git_verifier import RepositoryGitVerifier
 from scheduler.leases import QueueStore
+from scheduler.merge_cas import AtomicGitMergeCas, MergeCasError
 from scheduler.merge_authorization import (
     AUTO_MERGE_ELIGIBLE,
     BLOCKED,
     NEEDS_HUMAN_APPROVAL,
     MergeAuthorizationGate,
     TrustedApprovalPrincipal,
+    sign_project_lead_attestation,
 )
 from scheduler.models import TaskState
 from scheduler.pipeline import Pipeline, ReviewResult
@@ -35,6 +39,15 @@ DEPENDENT = "RFC-20261008-057"
 BASELINE = "a" * 40
 LEAD_ACTOR = "project-lead:mac-owner"
 LEAD_CHANNEL = "mac-codex:local"
+LEAD_KEY = b"fixture-project-lead-attestation-key"
+
+
+@dataclass
+class MutableClock:
+    value: float
+
+    def __call__(self) -> float:
+        return self.value
 
 
 def git(cwd: Path, *arguments: str) -> str:
@@ -105,6 +118,7 @@ def complete_fixture(
     title: str = "Provider transport",
     capability_group: str = "provider",
     with_dependency: bool = False,
+    clock=None,
 ) -> Fixture:
     remote = root / "remote.git"
     git(root, "init", "--bare", str(remote))
@@ -277,12 +291,31 @@ def complete_fixture(
     approval_evidence = artifacts.put_text(
         "project-lead-approval", "Project Lead accepted exact candidate"
     )
+    with state.connect() as connection:
+        review_run_id = int(
+            connection.execute(
+                "SELECT review_run_id FROM review_runs WHERE rfc_id = ? "
+                "ORDER BY review_run_id DESC LIMIT 1",
+                (active_id,),
+            ).fetchone()["review_run_id"]
+        )
+    approval_attestation = sign_project_lead_attestation(
+        LEAD_KEY,
+        rfc_id=active_id,
+        revision_digest=rfc.revision_digest,
+        candidate_digest=candidate_digest,
+        review_run_id=review_run_id,
+        actor=LEAD_ACTOR,
+        channel=LEAD_CHANNEL,
+        evidence_digest=approval_evidence,
+    )
     pipeline.approve_for_integration(
         active_id,
         candidate_digest,
         LEAD_ACTOR,
         approval_channel=LEAD_CHANNEL,
         approval_evidence_digest=approval_evidence,
+        approval_attestation=approval_attestation,
         available_at=9,
     )
 
@@ -341,8 +374,12 @@ def complete_fixture(
             project_lead_principals=frozenset(
                 {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
             ),
+            project_lead_attestation_keys={
+                TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL): LEAD_KEY
+            },
             trusted_remote_url=str(remote),
             approved_baseline_commit=BASELINE,
+            clock=clock or time.time,
         ),
         review_evidence,
     )
@@ -449,7 +486,7 @@ def insert_dependency_merge(fixture: Fixture, *, stale_contract: bool) -> None:
 class MergeAuthorizationTests(unittest.TestCase):
     def test_complete_ordinary_module_is_eligible_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            fixture = complete_fixture(Path(directory))
+            fixture = complete_fixture(Path(directory), clock=MutableClock(100))
             first = fixture.gate.evaluate(
                 fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
@@ -503,6 +540,9 @@ class MergeAuthorizationTests(unittest.TestCase):
                 project_lead_principals=frozenset(
                     {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
                 ),
+                project_lead_attestation_keys={
+                    TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL): LEAD_KEY
+                },
                 trusted_remote_url=str(fixture.root / "remote.git"),
                 approved_baseline_commit="b" * 40,
             )
@@ -528,6 +568,59 @@ class MergeAuthorizationTests(unittest.TestCase):
             for path in cases:
                 with self.subTest(path=path):
                     self.assertTrue(fixture.gate._risk_reasons(fixture.rfc, (path,)))
+
+    def test_credential_paths_fail_closed_but_module_differential_tests_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            credential_paths = (
+                ".env.production",
+                "packages/provider/.npmrc",
+                "home/service/.ssh/config",
+                "etc/ssh/sshd_config",
+                "deploy/id_ed25519",
+                "config/api-tokens.json",
+                "runtime/credential-store.json",
+                "certificates/client.pem",
+            )
+            for path in credential_paths:
+                with self.subTest(path=path):
+                    reasons = fixture.gate._risk_reasons(fixture.rfc, (path,))
+                    self.assertTrue(any("credential" in reason for reason in reasons))
+
+            ordinary = fixture.gate._risk_reasons(
+                fixture.rfc, ("tests/differential/provider_retry.test.ts",)
+            )
+            self.assertFalse(ordinary)
+            for path in (
+                "tests/differential/oracles/provider.json",
+                "tests/differential/fixtures/provider.json",
+                "tests/differential/framework/runner.ts",
+                "tools/differential-runner.ts",
+            ):
+                with self.subTest(path=path):
+                    self.assertTrue(fixture.gate._risk_reasons(fixture.rfc, (path,)))
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(
+                Path(directory),
+                target="tests/differential/provider_retry.test.ts",
+            )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(decision.disposition, AUTO_MERGE_ELIGIBLE)
+            self.assertFalse(decision.risk_reasons)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(
+                Path(directory),
+                target="tests/differential/oracles/provider.json",
+            )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
+            self.assertTrue(decision.risk_reasons)
 
     def test_project_lead_principal_and_channel_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -555,6 +648,11 @@ class MergeAuthorizationTests(unittest.TestCase):
                 project_lead_principals=frozenset(
                     {TrustedApprovalPrincipal(LEAD_ACTOR, "github:other-channel")}
                 ),
+                project_lead_attestation_keys={
+                    TrustedApprovalPrincipal(
+                        LEAD_ACTOR, "github:other-channel"
+                    ): LEAD_KEY
+                },
                 trusted_remote_url=str(fixture.root / "remote.git"),
                 approved_baseline_commit=BASELINE,
             )
@@ -602,6 +700,25 @@ class MergeAuthorizationTests(unittest.TestCase):
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertTrue(any("Project Lead approval" in item for item in decision.blockers))
 
+    def test_project_lead_attestation_cannot_be_forged_by_approval_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            principal = TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)
+            gate = MergeAuthorizationGate(
+                fixture.registry,
+                fixture.state,
+                RepositoryGitVerifier(fixture.repo),
+                project_lead_principals=frozenset({principal}),
+                project_lead_attestation_keys={principal: b"different-trusted-key-material-123"},
+                trusted_remote_url=str(fixture.root / "remote.git"),
+                approved_baseline_commit=BASELINE,
+            )
+            decision = gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("Project Lead approval" in item for item in decision.blockers))
+
     def test_remote_identity_is_pinned_normalized_and_credential_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = complete_fixture(Path(directory))
@@ -614,7 +731,26 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "https://github.com/lzzzyy123/zhuanxie.git",
                 )
             }
-            self.assertEqual(identities, {"host:github.com/lzzzyy123/zhuanxie"})
+            self.assertEqual(
+                identities, {"secure:host:github.com/lzzzyy123/zhuanxie"}
+            )
+            secure = identities.pop()
+            self.assertNotEqual(
+                secure,
+                verifier.normalize_remote_identity(
+                    "http://github.com/lzzzyy123/zhuanxie.git"
+                ),
+            )
+            self.assertNotEqual(
+                secure,
+                verifier.normalize_remote_identity(
+                    "git://github.com/lzzzyy123/zhuanxie.git"
+                ),
+            )
+            self.assertNotEqual(
+                secure,
+                verifier.normalize_remote_identity(str(fixture.root / "remote.git")),
+            )
 
             secret = "not-for-evidence"
             credential_url = (
@@ -627,6 +763,9 @@ class MergeAuthorizationTests(unittest.TestCase):
                 project_lead_principals=frozenset(
                     {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
                 ),
+                project_lead_attestation_keys={
+                    TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL): LEAD_KEY
+                },
                 trusted_remote_url=credential_url,
                 approved_baseline_commit=BASELINE,
             )
@@ -788,27 +927,33 @@ class MergeAuthorizationTests(unittest.TestCase):
 
     def test_authorization_reservation_is_idempotent_fenced_and_single_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            fixture = complete_fixture(Path(directory))
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
             eligible = fixture.gate.evaluate(
                 fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             main = str(eligible.evidence["trusted_main_commit"])
             refs_before = git(fixture.repo, "show-ref")
+            fixture.gate.merge_cas = AtomicGitMergeCas(
+                fixture.repo,
+                str(fixture.root / "remote.git"),
+                fixture.root / "merge-cas.lock",
+                timeout_seconds=5,
+            )
             reservation = fixture.gate.reserve_current_eligibility(
                 eligible.decision_digest,
                 "merge-attempt-1",
                 "merge-broker:fixture",
                 main,
                 lease_seconds=30,
-                now=100,
             )
+            clock.value = 101
             repeated = fixture.gate.reserve_current_eligibility(
                 eligible.decision_digest,
                 "merge-attempt-1",
                 "merge-broker:fixture",
                 main,
                 lease_seconds=30,
-                now=101,
             )
             self.assertEqual(repeated.reservation_id, reservation.reservation_id)
             with self.assertRaisesRegex(StateConflict, "already reserved"):
@@ -817,7 +962,6 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "merge-attempt-2",
                     "merge-broker:fixture",
                     main,
-                    now=101,
                 )
             with self.assertRaisesRegex(StateConflict, "stale"):
                 fixture.gate.consume_reserved_eligibility(
@@ -825,7 +969,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "merge-broker:other",
                     reservation.fencing_token,
                     main,
-                    now=102,
+                    fixture.candidate.commit_sha,
                 )
             with self.assertRaisesRegex(StateConflict, "fencing"):
                 fixture.gate.consume_reserved_eligibility(
@@ -833,7 +977,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "merge-broker:fixture",
                     reservation.fencing_token + 1,
                     main,
-                    now=102,
+                    fixture.candidate.commit_sha,
                 )
             with self.assertRaisesRegex(StateConflict, "CAS"):
                 fixture.gate.consume_reserved_eligibility(
@@ -841,44 +985,330 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "merge-broker:fixture",
                     reservation.fencing_token,
                     "b" * 40,
-                    now=102,
+                    fixture.candidate.commit_sha,
                 )
+            clock.value = 102
             consumed = fixture.gate.consume_reserved_eligibility(
                 reservation.reservation_id,
                 "merge-broker:fixture",
                 reservation.fencing_token,
                 main,
-                now=102,
+                fixture.candidate.commit_sha,
             )
             self.assertEqual(consumed.state, "consumed")
-            with self.assertRaisesRegex(StateConflict, "consumable"):
-                fixture.gate.consume_reserved_eligibility(
-                    reservation.reservation_id,
-                    "merge-broker:fixture",
-                    reservation.fencing_token,
-                    main,
-                    now=103,
-                )
-            with self.assertRaisesRegex(StateConflict, "already consumed"):
+            replay = fixture.gate.consume_reserved_eligibility(
+                reservation.reservation_id,
+                "merge-broker:fixture",
+                reservation.fencing_token,
+                main,
+                fixture.candidate.commit_sha,
+            )
+            self.assertEqual(replay, consumed)
+            with self.assertRaisesRegex(StateConflict, "stale"):
                 fixture.gate.reserve_current_eligibility(
                     eligible.decision_digest,
                     "merge-attempt-3",
                     "merge-broker:fixture",
                     main,
-                    now=103,
                 )
             self.assertEqual(git(fixture.repo, "show-ref"), refs_before)
+            self.assertEqual(
+                git(fixture.repo, "ls-remote", "origin", "refs/heads/main").split()[0],
+                fixture.candidate.commit_sha,
+            )
             with fixture.state.connect() as connection:
                 events = connection.execute(
                     "SELECT event_type FROM merge_authorization_events "
                     "WHERE reservation_id = ? ORDER BY event_id",
                     (reservation.reservation_id,),
                 ).fetchall()
-            self.assertEqual([row["event_type"] for row in events], ["RESERVED", "CONSUMED"])
+            self.assertEqual(
+                [row["event_type"] for row in events],
+                ["RESERVED", "MERGE_PREPARED", "MERGED"],
+            )
+
+    def test_authorization_subject_is_single_use_across_requesters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory), clock=MutableClock(100))
+            first = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            second = fixture.gate.evaluate(
+                fixture.rfc_id,
+                fixture.candidate.candidate_digest,
+                "merge-broker:alternate-requester",
+            )
+            self.assertNotEqual(first.decision_digest, second.decision_digest)
+            main = str(first.evidence["trusted_main_commit"])
+            reserved = fixture.gate.reserve_current_eligibility(
+                first.decision_digest,
+                "requester-one",
+                "merge-broker:fixture",
+                main,
+            )
+            with self.assertRaisesRegex(StateConflict, "already reserved"):
+                fixture.gate.reserve_current_eligibility(
+                    second.decision_digest,
+                    "requester-two",
+                    "merge-broker:fixture",
+                    main,
+                )
+            self.assertEqual(
+                reserved.authorization_subject_digest,
+                fixture.gate._authorization_subject_digest(second),
+            )
+
+    def test_reservation_uses_injected_trusted_clock_after_slow_revalidation(self) -> None:
+        for method in (
+            MergeAuthorizationGate.reserve_current_eligibility,
+            MergeAuthorizationGate.renew_reservation,
+            MergeAuthorizationGate.consume_reserved_eligibility,
+        ):
+            self.assertNotIn("now", inspect.signature(method).parameters)
+
+        with tempfile.TemporaryDirectory() as directory:
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(decision.evidence["trusted_main_commit"])
+            reservation = fixture.gate.reserve_current_eligibility(
+                decision.decision_digest,
+                "slow-revalidation",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=10,
+            )
+            class UncalledCas:
+                repository_identity = fixture.gate.trusted_repository_identity
+                maximum_duration_seconds = 5.0
+
+                def compare_and_swap(self, **_arguments) -> None:
+                    raise AssertionError("expired reservation must not reach Git CAS")
+
+            fixture.gate.merge_cas = UncalledCas()
+            original = fixture.gate._require_current_eligibility
+
+            def slow_revalidation(*arguments):
+                result = original(*arguments)
+                clock.value = 111
+                return result
+
+            with patch.object(
+                fixture.gate,
+                "_require_current_eligibility",
+                side_effect=slow_revalidation,
+            ), self.assertRaisesRegex(StateConflict, "cannot cover"):
+                fixture.gate.consume_reserved_eligibility(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                    main,
+                    fixture.candidate.commit_sha,
+                )
+
+    def test_atomic_merge_cas_consumes_only_after_remote_refs_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(decision.evidence["trusted_main_commit"])
+            reservation = fixture.gate.reserve_current_eligibility(
+                decision.decision_digest,
+                "atomic-merge-success",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=30,
+            )
+            merge_cas = AtomicGitMergeCas(
+                fixture.repo,
+                str(fixture.root / "remote.git"),
+                fixture.root / "merge-cas.lock",
+                timeout_seconds=5,
+            )
+            fixture.gate.merge_cas = merge_cas
+            consumed = fixture.gate.execute_reserved_merge(
+                reservation.reservation_id,
+                "merge-broker:fixture",
+                reservation.fencing_token,
+                fixture.candidate.commit_sha,
+            )
+            self.assertEqual(consumed.state, "consumed")
+            self.assertEqual(
+                git(fixture.repo, "ls-remote", "origin", "refs/heads/main").split()[0],
+                fixture.candidate.commit_sha,
+            )
+            with fixture.state.connect() as connection:
+                attempt = connection.execute(
+                    "SELECT state, observed_main_commit, observed_candidate_commit "
+                    "FROM merge_execution_attempts WHERE reservation_id = ?",
+                    (reservation.reservation_id,),
+                ).fetchone()
+            self.assertEqual(attempt["state"], "applied")
+            self.assertEqual(attempt["observed_main_commit"], fixture.candidate.commit_sha)
+            self.assertEqual(
+                attempt["observed_candidate_commit"], fixture.candidate.commit_sha
+            )
+
+    def test_atomic_merge_cas_candidate_race_never_writes_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(decision.evidence["trusted_main_commit"])
+            reservation = fixture.gate.reserve_current_eligibility(
+                decision.decision_digest,
+                "atomic-merge-race",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=30,
+            )
+            delegate = AtomicGitMergeCas(
+                fixture.repo,
+                str(fixture.root / "remote.git"),
+                fixture.root / "merge-cas.lock",
+                timeout_seconds=5,
+            )
+
+            class CandidateRaceCas:
+                repository_identity = delegate.repository_identity
+                maximum_duration_seconds = delegate.maximum_duration_seconds
+
+                def compare_and_swap(self, **arguments) -> None:
+                    git(fixture.repo, "checkout", "-b", "candidate-race", "main")
+                    (fixture.repo / "race.txt").write_text("race\n")
+                    git(fixture.repo, "add", "race.txt")
+                    git(
+                        fixture.repo,
+                        "-c",
+                        "user.name=Race",
+                        "-c",
+                        "user.email=race@example.invalid",
+                        "commit",
+                        "-m",
+                        "candidate race",
+                    )
+                    git(
+                        fixture.repo,
+                        "push",
+                        "origin",
+                        f"+candidate-race:refs/heads/{fixture.candidate.branch}",
+                    )
+                    delegate.compare_and_swap(**arguments)
+
+            fixture.gate.merge_cas = CandidateRaceCas()
+            with self.assertRaises(MergeCasError):
+                fixture.gate.execute_reserved_merge(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                    fixture.candidate.commit_sha,
+                )
+            fixture.gate.merge_cas = delegate
+            self.assertEqual(
+                git(fixture.repo, "ls-remote", "origin", "refs/heads/main").split()[0],
+                main,
+            )
+            with self.assertRaisesRegex(StateConflict, "manual recovery"):
+                fixture.gate.reconcile_reserved_merge(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                )
+            with fixture.state.connect() as connection:
+                state = connection.execute(
+                    "SELECT state FROM merge_authorization_reservations "
+                    "WHERE reservation_id = ?",
+                    (reservation.reservation_id,),
+                ).fetchone()["state"]
+                attempt = connection.execute(
+                    "SELECT state, error_code FROM merge_execution_attempts "
+                    "WHERE reservation_id = ?",
+                    (reservation.reservation_id,),
+                ).fetchone()
+            self.assertEqual(state, "reserved")
+            self.assertEqual((attempt["state"], attempt["error_code"]), (
+                "blocked", "REMOTE_REF_DIVERGED"
+            ))
+
+    def test_atomic_merge_cas_unchanged_failure_can_retry_same_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(decision.evidence["trusted_main_commit"])
+            reservation = fixture.gate.reserve_current_eligibility(
+                decision.decision_digest,
+                "atomic-merge-retry",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=30,
+            )
+            delegate = AtomicGitMergeCas(
+                fixture.repo,
+                str(fixture.root / "remote.git"),
+                fixture.root / "merge-cas.lock",
+                timeout_seconds=5,
+            )
+
+            class TransientFailureCas:
+                repository_identity = delegate.repository_identity
+                maximum_duration_seconds = delegate.maximum_duration_seconds
+
+                def compare_and_swap(self, **_arguments) -> None:
+                    raise MergeCasError("transient fixture failure")
+
+            fixture.gate.merge_cas = TransientFailureCas()
+            with self.assertRaises(MergeCasError):
+                fixture.gate.execute_reserved_merge(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                    fixture.candidate.commit_sha,
+                )
+            fixture.gate.merge_cas = delegate
+            with self.assertRaisesRegex(StateConflict, "not applied"):
+                fixture.gate.reconcile_reserved_merge(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                )
+            consumed = fixture.gate.execute_reserved_merge(
+                reservation.reservation_id,
+                "merge-broker:fixture",
+                reservation.fencing_token,
+                fixture.candidate.commit_sha,
+            )
+            self.assertEqual(consumed.state, "consumed")
+            with fixture.state.connect() as connection:
+                attempts = connection.execute(
+                    "SELECT COUNT(*) FROM merge_execution_attempts "
+                    "WHERE reservation_id = ?",
+                    (reservation.reservation_id,),
+                ).fetchone()[0]
+                events = [
+                    row["event_type"]
+                    for row in connection.execute(
+                        "SELECT event_type FROM merge_authorization_events "
+                        "WHERE reservation_id = ? ORDER BY event_id",
+                        (reservation.reservation_id,),
+                    ).fetchall()
+                ]
+            self.assertEqual(attempts, 1)
+            self.assertIn("MERGE_RETRY", events)
+            self.assertEqual(events[-1], "MERGED")
 
     def test_expired_reservation_requires_explicit_abort_and_advances_fence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            fixture = complete_fixture(Path(directory))
+            clock = MutableClock(100)
+            fixture = complete_fixture(Path(directory), clock=clock)
             eligible = fixture.gate.evaluate(
                 fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
@@ -889,22 +1319,27 @@ class MergeAuthorizationTests(unittest.TestCase):
                 "merge-broker:fixture",
                 main,
                 lease_seconds=10,
-                now=100,
             )
+            fixture.gate.merge_cas = AtomicGitMergeCas(
+                fixture.repo,
+                str(fixture.root / "remote.git"),
+                fixture.root / "merge-cas.lock",
+                timeout_seconds=5,
+            )
+            clock.value = 111
             with self.assertRaisesRegex(StateConflict, "live"):
                 fixture.gate.renew_reservation(
                     expired.reservation_id,
                     "merge-broker:fixture",
                     expired.fencing_token,
-                    now=111,
                 )
-            with self.assertRaisesRegex(StateConflict, "consumable"):
+            with self.assertRaisesRegex(StateConflict, "cannot cover"):
                 fixture.gate.consume_reserved_eligibility(
                     expired.reservation_id,
                     "merge-broker:fixture",
                     expired.fencing_token,
                     main,
-                    now=111,
+                    fixture.candidate.commit_sha,
                 )
             with self.assertRaisesRegex(StateConflict, "expired pending explicit abort"):
                 fixture.gate.reserve_current_eligibility(
@@ -912,7 +1347,6 @@ class MergeAuthorizationTests(unittest.TestCase):
                     "replacement-before-abort",
                     "merge-broker:fixture",
                     main,
-                    now=111,
                 )
             aborted = fixture.gate.abort_reservation(
                 expired.reservation_id,
@@ -921,26 +1355,26 @@ class MergeAuthorizationTests(unittest.TestCase):
                 "operator reconciled expired broker process",
             )
             self.assertEqual(aborted.state, "aborted")
+            clock.value = 112
             replacement = fixture.gate.reserve_current_eligibility(
                 eligible.decision_digest,
                 "replacement-after-abort",
                 "merge-broker:fixture",
                 main,
-                now=112,
             )
             self.assertGreater(replacement.fencing_token, expired.fencing_token)
+            clock.value = 113
             renewed = fixture.gate.renew_reservation(
                 replacement.reservation_id,
                 "merge-broker:fixture",
                 replacement.fencing_token,
                 lease_seconds=20,
-                now=113,
             )
             self.assertEqual(renewed.expires_at, 133)
 
     def test_concurrent_authorization_reservation_has_one_winner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            fixture = complete_fixture(Path(directory))
+            fixture = complete_fixture(Path(directory), clock=MutableClock(100))
             eligible = fixture.gate.evaluate(
                 fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
@@ -958,7 +1392,6 @@ class MergeAuthorizationTests(unittest.TestCase):
                             key,
                             "merge-broker:fixture",
                             main,
-                            now=100,
                         )
                     )
                 except StateConflict as exc:
@@ -1156,7 +1589,6 @@ class MergeAuthorizationTests(unittest.TestCase):
                 "immutable-event-attempt",
                 "merge-broker:fixture",
                 str(decision.evidence["trusted_main_commit"]),
-                now=100,
             )
             with fixture.state.connect() as connection:
                 event = connection.execute(
