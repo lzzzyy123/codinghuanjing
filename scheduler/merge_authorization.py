@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +27,12 @@ from .testing import digest_json
 POLICY_VERSION = "merge-authorization/v1"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+APPROVAL_ACTOR_RE = re.compile(r"^project-lead:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+APPROVAL_CHANNEL_RE = re.compile(
+    r"^(?:mac-codex|github):[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$"
+)
+MERGE_BROKER_RE = re.compile(r"^merge-broker:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RESERVATION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 
 AUTO_MERGE_ELIGIBLE = "AUTO_MERGE_ELIGIBLE"
 NEEDS_HUMAN_APPROVAL = "NEEDS_HUMAN_APPROVAL"
@@ -81,6 +90,10 @@ SENSITIVE_COMPONENTS = frozenset(
         "security",
     }
 )
+SENSITIVE_GATE_COMPONENTS = frozenset(
+    {"baseline", "baselines", "differential", "gate", "gates", "parity"}
+)
+MAX_RESERVATION_LEASE_SECONDS = 3600
 
 
 @dataclass(frozen=True)
@@ -101,6 +114,28 @@ class MergeAuthorizationDecision:
     created_at: str
 
 
+@dataclass(frozen=True)
+class TrustedApprovalPrincipal:
+    actor: str
+    channel: str
+
+
+@dataclass(frozen=True)
+class MergeAuthorizationReservation:
+    reservation_id: str
+    reservation_key: str
+    decision_digest: str
+    rfc_id: str
+    candidate_digest: str
+    holder_identity: str
+    expected_trusted_main_commit: str
+    fencing_token: int
+    state: str
+    expires_at: float
+    created_at: str
+    updated_at: str
+
+
 class MergeAuthorizationGate:
     """Evaluate and durably record an exact, non-executing merge decision."""
 
@@ -110,15 +145,21 @@ class MergeAuthorizationGate:
         store: StateStore,
         git_verifier: RepositoryGitVerifier,
         *,
-        project_lead_actors: frozenset[str] = frozenset(),
+        project_lead_principals: frozenset[TrustedApprovalPrincipal] = frozenset(),
         trusted_publication_remote: str = "origin",
+        trusted_remote_url: str | None = None,
         trusted_main_branch: str = "main",
         approved_baseline_commit: str | None = None,
     ) -> None:
-        if not project_lead_actors or any(
-            not actor.strip() for actor in project_lead_actors
-        ):
-            raise ValueError("at least one trusted Project Lead actor is required")
+        if not project_lead_principals:
+            raise ValueError("at least one trusted Project Lead principal is required")
+        for principal in project_lead_principals:
+            if (
+                not isinstance(principal, TrustedApprovalPrincipal)
+                or not APPROVAL_ACTOR_RE.fullmatch(principal.actor)
+                or not APPROVAL_CHANNEL_RE.fullmatch(principal.channel)
+            ):
+                raise ValueError("invalid trusted Project Lead principal")
         if not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", trusted_publication_remote
         ):
@@ -133,11 +174,16 @@ class MergeAuthorizationGate:
             approved_baseline_commit
         ):
             raise ValueError("an approved full Python baseline commit is required")
+        if trusted_remote_url is None:
+            raise ValueError("a pinned trusted remote URL is required")
         self.registry = registry
         self.store = store
         self.git_verifier = git_verifier
-        self.project_lead_actors = frozenset(project_lead_actors)
+        self.project_lead_principals = frozenset(project_lead_principals)
         self.trusted_publication_remote = trusted_publication_remote
+        self.trusted_repository_identity = git_verifier.normalize_remote_identity(
+            trusted_remote_url
+        )
         self.trusted_main_branch = trusted_main_branch
         self.approved_baseline_commit = approved_baseline_commit
 
@@ -161,6 +207,7 @@ class MergeAuthorizationGate:
             "baseline_commit": self.registry.baseline_commit,
             "required_contracts": dict(sorted(rfc.requires.items())),
             "provided_contracts": dict(sorted(rfc.provides.items())),
+            "trusted_repository_identity": self.trusted_repository_identity,
         }
 
         def block(reason: str) -> None:
@@ -169,10 +216,17 @@ class MergeAuthorizationGate:
 
         trusted_main_commit: str | None = None
         try:
+            actual_remote_identity = self.git_verifier.remote_identity(
+                self.trusted_publication_remote
+            )
+            evidence["observed_repository_identity"] = actual_remote_identity
+            if actual_remote_identity != self.trusted_repository_identity:
+                block("Git remote does not match the pinned repository identity")
             trusted_main_commit = self.git_verifier.resolve_trusted_main()
             evidence["trusted_main_commit"] = trusted_main_commit
-            live_main_commit = self.git_verifier.resolve_remote_head(
+            live_main_commit = self.git_verifier.resolve_pinned_remote_head(
                 self.trusted_publication_remote,
+                self.trusted_repository_identity,
                 f"refs/heads/{self.trusted_main_branch}",
             )
             evidence["trusted_remote_main_commit"] = live_main_commit
@@ -382,16 +436,18 @@ class MergeAuthorizationGate:
                 rfc_id,
                 rfc.revision_digest,
                 candidate_digest,
-                self.project_lead_actors,
+                self.project_lead_principals,
             )
             review = None
             if approval is None:
                 block("Project Lead approval is missing for the exact candidate")
             else:
-                review_id, actor, sequence = approval
+                review_id, actor, channel, approval_evidence, sequence = approval
                 evidence.update(
                     {
                         "project_lead_actor": actor,
+                        "project_lead_channel": channel,
+                        "project_lead_approval_evidence": approval_evidence,
                         "project_lead_transition_sequence": sequence,
                         "review_run_id": review_id,
                     }
@@ -445,8 +501,10 @@ class MergeAuthorizationGate:
                     evidence["publication_id"] = int(publication["publication_id"])
                     evidence["publication_remote"] = self.trusted_publication_remote
                     try:
-                        remote_commit = self.git_verifier.resolve_remote_head(
-                            self.trusted_publication_remote, ref_name
+                        remote_commit = self.git_verifier.resolve_pinned_remote_head(
+                            self.trusted_publication_remote,
+                            self.trusted_repository_identity,
+                            ref_name,
                         )
                         evidence["publication_remote_commit"] = remote_commit
                         if remote_commit != candidate["commit_sha"]:
@@ -563,12 +621,14 @@ class MergeAuthorizationGate:
             created_at=created_at,
         )
 
-    def require_current_eligibility(
-        self, decision_digest: str
+    def _require_current_eligibility(
+        self, decision_digest: str, expected_trusted_main_commit: str
     ) -> MergeAuthorizationDecision:
-        """Re-evaluate an immutable decision immediately before any later executor uses it."""
+        """Re-evaluate an immutable decision for reservation/consumption only."""
         if not DIGEST_RE.fullmatch(decision_digest):
             raise ValueError("decision_digest must be a sha256 digest")
+        if not COMMIT_RE.fullmatch(expected_trusted_main_commit):
+            raise ValueError("expected trusted-main commit must be a full Git SHA")
         with self.store.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM merge_authorization_decisions WHERE decision_digest = ?",
@@ -585,9 +645,355 @@ class MergeAuthorizationGate:
         if (
             current.decision_digest != decision_digest
             or current.disposition != AUTO_MERGE_ELIGIBLE
+            or current.evidence.get("trusted_main_commit")
+            != expected_trusted_main_commit
+            or current.evidence.get("trusted_remote_main_commit")
+            != expected_trusted_main_commit
         ):
             raise StateConflict("merge authorization decision is stale; current evidence differs")
         return current
+
+    def reserve_current_eligibility(
+        self,
+        decision_digest: str,
+        reservation_key: str,
+        holder_identity: str,
+        expected_trusted_main_commit: str,
+        *,
+        lease_seconds: float = 300,
+        now: float | None = None,
+    ) -> MergeAuthorizationReservation:
+        """Reserve one decision for a single fenced future merge attempt."""
+        self._validate_reservation_identity(reservation_key, holder_identity, lease_seconds)
+        current = self._require_current_eligibility(
+            decision_digest, expected_trusted_main_commit
+        )
+        timestamp = time.time() if now is None else now
+        now_text = utc_now()
+        with self.store.transaction() as connection:
+            existing_key = connection.execute(
+                "SELECT * FROM merge_authorization_reservations WHERE reservation_key = ?",
+                (reservation_key,),
+            ).fetchone()
+            if existing_key is not None:
+                if (
+                    existing_key["decision_digest"] == decision_digest
+                    and existing_key["holder_identity"] == holder_identity
+                    and existing_key["expected_trusted_main_commit"]
+                    == expected_trusted_main_commit
+                    and existing_key["state"] == "reserved"
+                    and float(existing_key["expires_at"]) > timestamp
+                ):
+                    return self._reservation(existing_key)
+                raise StateConflict("reservation key was already used with different state")
+
+            active = connection.execute(
+                "SELECT state, expires_at FROM merge_authorization_reservations "
+                "WHERE decision_digest = ? AND state IN ('reserved', 'consumed')",
+                (decision_digest,),
+            ).fetchone()
+            if active is not None:
+                suffix = (
+                    " and is expired pending explicit abort"
+                    if active["state"] == "reserved"
+                    and float(active["expires_at"]) <= timestamp
+                    else ""
+                )
+                raise StateConflict(
+                    f"merge authorization is already {active['state']}{suffix}"
+                )
+
+            connection.execute(
+                "INSERT INTO merge_authorization_fences VALUES (?, 1) "
+                "ON CONFLICT(decision_digest) DO UPDATE "
+                "SET last_token = last_token + 1",
+                (decision_digest,),
+            )
+            fencing_token = int(
+                connection.execute(
+                    "SELECT last_token FROM merge_authorization_fences "
+                    "WHERE decision_digest = ?",
+                    (decision_digest,),
+                ).fetchone()["last_token"]
+            )
+            reservation_id = str(uuid.uuid4())
+            expires_at = timestamp + lease_seconds
+            try:
+                connection.execute(
+                    "INSERT INTO merge_authorization_reservations "
+                    "(reservation_id, reservation_key, decision_digest, rfc_id, "
+                    "candidate_digest, holder_identity, expected_trusted_main_commit, "
+                    "fencing_token, state, expires_at, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)",
+                    (
+                        reservation_id,
+                        reservation_key,
+                        decision_digest,
+                        current.rfc_id,
+                        current.candidate_digest,
+                        holder_identity,
+                        expected_trusted_main_commit,
+                        fencing_token,
+                        expires_at,
+                        now_text,
+                        now_text,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StateConflict("merge authorization reservation raced") from exc
+            self._append_reservation_event(
+                connection,
+                reservation_id,
+                "RESERVED",
+                fencing_token,
+                holder_identity,
+                {
+                    "decision_digest": decision_digest,
+                    "expected_trusted_main_commit": expected_trusted_main_commit,
+                    "expires_at": expires_at,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        return self._reservation(row)
+
+    def renew_reservation(
+        self,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+        *,
+        lease_seconds: float = 300,
+        now: float | None = None,
+    ) -> MergeAuthorizationReservation:
+        self._validate_reservation_identity("renewal", holder_identity, lease_seconds)
+        timestamp = time.time() if now is None else now
+        with self.store.transaction() as connection:
+            row = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
+            if row["state"] != "reserved" or float(row["expires_at"]) <= timestamp:
+                raise StateConflict("only a live reservation can be renewed")
+            expires_at = timestamp + lease_seconds
+            updated = connection.execute(
+                "UPDATE merge_authorization_reservations SET expires_at = ?, updated_at = ? "
+                "WHERE reservation_id = ? AND holder_identity = ? AND fencing_token = ? "
+                "AND state = 'reserved' AND expires_at > ?",
+                (
+                    expires_at,
+                    utc_now(),
+                    reservation_id,
+                    holder_identity,
+                    fencing_token,
+                    timestamp,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StateConflict("reservation changed during renewal")
+            self._append_reservation_event(
+                connection,
+                reservation_id,
+                "RENEWED",
+                fencing_token,
+                holder_identity,
+                {"expires_at": expires_at},
+            )
+            renewed = connection.execute(
+                "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        return self._reservation(renewed)
+
+    def consume_reserved_eligibility(
+        self,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+        expected_trusted_main_commit: str,
+        *,
+        now: float | None = None,
+    ) -> MergeAuthorizationReservation:
+        """Consume exactly once after revalidation; this method performs no Git write."""
+        timestamp = time.time() if now is None else now
+        with self.store.connect() as connection:
+            initial = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
+        if initial["expected_trusted_main_commit"] != expected_trusted_main_commit:
+            raise StateConflict("reservation trusted-main CAS input does not match")
+        self._require_current_eligibility(
+            str(initial["decision_digest"]), expected_trusted_main_commit
+        )
+        with self.store.transaction() as connection:
+            row = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
+            if row["state"] != "reserved" or float(row["expires_at"]) <= timestamp:
+                raise StateConflict("reservation is not live and consumable")
+            updated = connection.execute(
+                "UPDATE merge_authorization_reservations SET state = 'consumed', "
+                "updated_at = ? WHERE reservation_id = ? AND holder_identity = ? "
+                "AND fencing_token = ? AND state = 'reserved' AND expires_at > ?",
+                (
+                    utc_now(),
+                    reservation_id,
+                    holder_identity,
+                    fencing_token,
+                    timestamp,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StateConflict("reservation changed during consumption")
+            self._append_reservation_event(
+                connection,
+                reservation_id,
+                "CONSUMED",
+                fencing_token,
+                holder_identity,
+                {"expected_trusted_main_commit": expected_trusted_main_commit},
+            )
+            consumed = connection.execute(
+                "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        return self._reservation(consumed)
+
+    def abort_reservation(
+        self,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+        reason: str,
+    ) -> MergeAuthorizationReservation:
+        if not reason.strip():
+            raise ValueError("abort reason must be non-empty")
+        with self.store.transaction() as connection:
+            row = self._locked_reservation(
+                connection, reservation_id, holder_identity, fencing_token
+            )
+            if row["state"] != "reserved":
+                raise StateConflict("only a reserved authorization can be aborted")
+            updated = connection.execute(
+                "UPDATE merge_authorization_reservations SET state = 'aborted', "
+                "updated_at = ? WHERE reservation_id = ? AND holder_identity = ? "
+                "AND fencing_token = ? AND state = 'reserved'",
+                (utc_now(), reservation_id, holder_identity, fencing_token),
+            )
+            if updated.rowcount != 1:
+                raise StateConflict("reservation changed during abort")
+            self._append_reservation_event(
+                connection,
+                reservation_id,
+                "ABORTED",
+                fencing_token,
+                holder_identity,
+                {"reason": reason.strip()},
+            )
+            aborted = connection.execute(
+                "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        return self._reservation(aborted)
+
+    @staticmethod
+    def _validate_reservation_identity(
+        reservation_key: str, holder_identity: str, lease_seconds: float
+    ) -> None:
+        if not RESERVATION_KEY_RE.fullmatch(reservation_key):
+            raise ValueError("invalid merge authorization reservation key")
+        if not MERGE_BROKER_RE.fullmatch(holder_identity):
+            raise ValueError("invalid merge broker identity")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(float(lease_seconds))
+            or lease_seconds <= 0
+            or lease_seconds > MAX_RESERVATION_LEASE_SECONDS
+        ):
+            raise ValueError(
+                "merge authorization lease must be positive and at most "
+                f"{MAX_RESERVATION_LEASE_SECONDS} seconds"
+            )
+
+    @staticmethod
+    def _locked_reservation(
+        connection: sqlite3.Connection,
+        reservation_id: str,
+        holder_identity: str,
+        fencing_token: int,
+    ) -> sqlite3.Row:
+        try:
+            parsed_id = uuid.UUID(reservation_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("invalid merge authorization reservation ID") from exc
+        if str(parsed_id) != reservation_id:
+            raise ValueError("invalid merge authorization reservation ID")
+        if not MERGE_BROKER_RE.fullmatch(holder_identity):
+            raise ValueError("invalid merge broker identity")
+        if (
+            isinstance(fencing_token, bool)
+            or not isinstance(fencing_token, int)
+            or fencing_token <= 0
+        ):
+            raise ValueError("invalid merge authorization fencing token")
+        row = connection.execute(
+            "SELECT * FROM merge_authorization_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("merge authorization reservation does not exist")
+        if (
+            row["holder_identity"] != holder_identity
+            or int(row["fencing_token"]) != fencing_token
+        ):
+            raise StateConflict("stale merge authorization holder or fencing token")
+        return row
+
+    @staticmethod
+    def _append_reservation_event(
+        connection: sqlite3.Connection,
+        reservation_id: str,
+        event_type: str,
+        fencing_token: int,
+        actor: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if event_type not in {"RESERVED", "RENEWED", "CONSUMED", "ABORTED"}:
+            raise ValueError("invalid merge authorization event type")
+        connection.execute(
+            "INSERT INTO merge_authorization_events "
+            "(reservation_id, event_type, fencing_token, actor, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                reservation_id,
+                event_type,
+                fencing_token,
+                actor,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _reservation(row: sqlite3.Row) -> MergeAuthorizationReservation:
+        if row is None:
+            raise StateConflict("merge authorization reservation was not persisted")
+        return MergeAuthorizationReservation(
+            reservation_id=str(row["reservation_id"]),
+            reservation_key=str(row["reservation_key"]),
+            decision_digest=str(row["decision_digest"]),
+            rfc_id=str(row["rfc_id"]),
+            candidate_digest=str(row["candidate_digest"]),
+            holder_identity=str(row["holder_identity"]),
+            expected_trusted_main_commit=str(row["expected_trusted_main_commit"]),
+            fencing_token=int(row["fencing_token"]),
+            state=str(row["state"]),
+            expires_at=float(row["expires_at"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
 
     def history(self, rfc_id: str) -> tuple[MergeAuthorizationDecision, ...]:
         with self.store.connect() as connection:
@@ -731,12 +1137,21 @@ class MergeAuthorizationGate:
         for path in changed_paths:
             lowered = path.lower()
             components = set(re.split(r"[^a-z0-9]+", lowered))
+            basename = lowered.rsplit("/", 1)[-1]
             if path in shared_files:
                 reasons.add(f"broker-managed shared resource: {path}")
-            if path in SENSITIVE_EXACT_PATHS or lowered.startswith(SENSITIVE_PREFIXES):
+            if (
+                path in SENSITIVE_EXACT_PATHS
+                or basename in {"codeowners", ".gitattributes"}
+                or lowered.startswith(SENSITIVE_PREFIXES)
+            ):
                 reasons.add(f"protected control or gate path: {path}")
             if components.intersection(SENSITIVE_COMPONENTS):
                 reasons.add(f"security, permission, or credential path: {path}")
+            if components.intersection(SENSITIVE_GATE_COMPONENTS) or any(
+                token in lowered for token in SENSITIVE_GATE_COMPONENTS
+            ):
+                reasons.add(f"parity, differential, baseline, or test gate path: {path}")
         return reasons
 
     def _revision_risk_reasons(self, connection, rfc: RfcRevision, block) -> set[str]:
@@ -766,6 +1181,8 @@ class MergeAuthorizationGate:
         current_contracts = rfc.raw.get("contracts", {})
         if previous_contracts.get("provides", {}) != current_contracts.get("provides", {}):
             reasons.add("provided shared interface contract changed from the superseded revision")
+        if previous_contracts.get("requires", {}) != current_contracts.get("requires", {}):
+            reasons.add("required shared interface contract changed from the superseded revision")
         return reasons
 
     @staticmethod
@@ -812,7 +1229,7 @@ class MergeAuthorizationGate:
         rfc_id,
         revision_digest,
         candidate_digest,
-        trusted_actors: frozenset[str],
+        trusted_principals: frozenset[TrustedApprovalPrincipal],
     ):
         rows = connection.execute(
             "SELECT sequence, actor, metadata_json FROM transitions WHERE rfc_id = ? "
@@ -829,15 +1246,45 @@ class MergeAuthorizationGate:
             try:
                 metadata = json.loads(row["metadata_json"])
                 review_id = metadata.get("review_run_id")
+                channel = metadata.get("approval_channel")
+                approval_evidence = metadata.get("approval_evidence_digest")
+                approval_id = metadata.get("approval_id")
             except (TypeError, json.JSONDecodeError, AttributeError):
                 continue
             actor = str(row["actor"])
             if (
-                metadata.get("candidate_digest") == candidate_digest
-                and isinstance(review_id, int)
-                and actor in trusted_actors
+                not isinstance(review_id, int)
+                or isinstance(review_id, bool)
+                or not isinstance(approval_id, int)
+                or isinstance(approval_id, bool)
+                or not isinstance(channel, str)
+                or not isinstance(approval_evidence, str)
             ):
-                return review_id, actor, int(row["sequence"])
+                continue
+            approval_record = connection.execute(
+                "SELECT 1 FROM project_lead_approvals JOIN artifacts "
+                "ON artifacts.digest = project_lead_approvals.evidence_digest "
+                "WHERE approval_id = ? AND rfc_id = ? AND revision_digest = ? "
+                "AND candidate_digest = ? AND review_run_id = ? AND actor = ? "
+                "AND channel = ? AND evidence_digest = ? "
+                "AND artifacts.kind = 'project-lead-approval'",
+                (
+                    approval_id,
+                    rfc_id,
+                    revision_digest,
+                    candidate_digest,
+                    review_id,
+                    actor,
+                    channel,
+                    approval_evidence,
+                ),
+            ).fetchone()
+            if (
+                metadata.get("candidate_digest") == candidate_digest
+                and TrustedApprovalPrincipal(actor, channel) in trusted_principals
+                and approval_record is not None
+            ):
+                return review_id, actor, channel, approval_evidence, int(row["sequence"])
         return None
 
     @staticmethod

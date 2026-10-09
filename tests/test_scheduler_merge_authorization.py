@@ -8,6 +8,8 @@ import unittest
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Barrier, Thread
+from unittest.mock import patch
 
 from scheduler.evidence import ArtifactStore
 from scheduler.git_broker import Candidate
@@ -18,6 +20,7 @@ from scheduler.merge_authorization import (
     BLOCKED,
     NEEDS_HUMAN_APPROVAL,
     MergeAuthorizationGate,
+    TrustedApprovalPrincipal,
 )
 from scheduler.models import TaskState
 from scheduler.pipeline import Pipeline, ReviewResult
@@ -30,6 +33,8 @@ RFC = "RFC-20261008-056"
 DEPENDENCY = "RFC-20261008-056"
 DEPENDENT = "RFC-20261008-057"
 BASELINE = "a" * 40
+LEAD_ACTOR = "project-lead:mac-owner"
+LEAD_CHANNEL = "mac-codex:local"
 
 
 def git(cwd: Path, *arguments: str) -> str:
@@ -269,8 +274,16 @@ def complete_fixture(
         ReviewResult("PASS", "PASS", review_evidence),
         now=8,
     )
+    approval_evidence = artifacts.put_text(
+        "project-lead-approval", "Project Lead accepted exact candidate"
+    )
     pipeline.approve_for_integration(
-        active_id, candidate_digest, "project-lead", available_at=9
+        active_id,
+        candidate_digest,
+        LEAD_ACTOR,
+        approval_channel=LEAD_CHANNEL,
+        approval_evidence_digest=approval_evidence,
+        available_at=9,
     )
 
     integration = queue.claim("integrator-1", now=9, lease_seconds=100)
@@ -325,7 +338,10 @@ def complete_fixture(
             registry,
             state,
             verifier,
-            project_lead_actors=frozenset({"project-lead"}),
+            project_lead_principals=frozenset(
+                {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
+            ),
+            trusted_remote_url=str(remote),
             approved_baseline_commit=BASELINE,
         ),
         review_evidence,
@@ -435,10 +451,10 @@ class MergeAuthorizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = complete_fixture(Path(directory))
             first = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             second = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(first.disposition, AUTO_MERGE_ELIGIBLE)
             self.assertEqual(first.blockers, ())
@@ -459,7 +475,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 capability_group="security",
             )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
             self.assertFalse(decision.blockers)
@@ -473,7 +489,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 capability_group="repository",
             )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
             self.assertTrue(any("CODEOWNERS" in item for item in decision.risk_reasons))
@@ -484,14 +500,184 @@ class MergeAuthorizationTests(unittest.TestCase):
                 fixture.registry,
                 fixture.state,
                 RepositoryGitVerifier(fixture.repo),
-                project_lead_actors=frozenset({"project-lead"}),
+                project_lead_principals=frozenset(
+                    {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
+                ),
+                trusted_remote_url=str(fixture.root / "remote.git"),
                 approved_baseline_commit="b" * 40,
             )
             decision = gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, NEEDS_HUMAN_APPROVAL)
             self.assertTrue(any("baseline" in item for item in decision.risk_reasons))
+
+    def test_sensitive_control_names_and_gate_semantics_are_detected_anywhere(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            cases = (
+                "docs/CODEOWNERS",
+                "src/generated/.gitattributes",
+                "src/compat/parity/report.ts",
+                "src/oracles/differential-runner.ts",
+                "src/release/gates/check.ts",
+                "src/state/baselines/catalog.ts",
+                "src/compat/paritySnapshot.ts",
+                "src/release/integrationGate.ts",
+            )
+            for path in cases:
+                with self.subTest(path=path):
+                    self.assertTrue(fixture.gate._risk_reasons(fixture.rfc, (path,)))
+
+    def test_project_lead_principal_and_channel_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            verifier = RepositoryGitVerifier(fixture.repo)
+            for actor in ("scheduler", "tester", "reviewer-1"):
+                with self.subTest(actor=actor), self.assertRaisesRegex(
+                    ValueError, "Project Lead principal"
+                ):
+                    MergeAuthorizationGate(
+                        fixture.registry,
+                        fixture.state,
+                        verifier,
+                        project_lead_principals=frozenset(
+                            {TrustedApprovalPrincipal(actor, LEAD_CHANNEL)}
+                        ),
+                        trusted_remote_url=str(fixture.root / "remote.git"),
+                        approved_baseline_commit=BASELINE,
+                    )
+
+            wrong_channel = MergeAuthorizationGate(
+                fixture.registry,
+                fixture.state,
+                verifier,
+                project_lead_principals=frozenset(
+                    {TrustedApprovalPrincipal(LEAD_ACTOR, "github:other-channel")}
+                ),
+                trusted_remote_url=str(fixture.root / "remote.git"),
+                approved_baseline_commit=BASELINE,
+            )
+            decision = wrong_channel.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("Project Lead approval" in item for item in decision.blockers))
+
+    def test_project_lead_approval_is_exactly_bound_and_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            with fixture.state.connect() as connection:
+                approval = connection.execute(
+                    "SELECT approval_id FROM project_lead_approvals WHERE rfc_id = ?",
+                    (fixture.rfc_id,),
+                ).fetchone()
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(
+                        "UPDATE project_lead_approvals SET channel = 'github:forged' "
+                        "WHERE approval_id = ?",
+                        (approval["approval_id"],),
+                    )
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(
+                        "DELETE FROM project_lead_approvals WHERE approval_id = ?",
+                        (approval["approval_id"],),
+                    )
+
+            with fixture.state.transaction() as connection:
+                transition = connection.execute(
+                    "SELECT id, metadata_json FROM transitions WHERE rfc_id = ? "
+                    "AND from_state = 'LeadReview' AND to_state = 'IntegrationReady'",
+                    (fixture.rfc_id,),
+                ).fetchone()
+                metadata = json.loads(transition["metadata_json"])
+                metadata["approval_id"] += 1000
+                connection.execute(
+                    "UPDATE transitions SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata, sort_keys=True), transition["id"]),
+                )
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(decision.disposition, BLOCKED)
+            self.assertTrue(any("Project Lead approval" in item for item in decision.blockers))
+
+    def test_remote_identity_is_pinned_normalized_and_credential_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            verifier = RepositoryGitVerifier(fixture.repo)
+            identities = {
+                verifier.normalize_remote_identity(value)
+                for value in (
+                    "git@github.com:lzzzyy123/zhuanxie.git",
+                    "ssh://git@github.com/lzzzyy123/zhuanxie.git",
+                    "https://github.com/lzzzyy123/zhuanxie.git",
+                )
+            }
+            self.assertEqual(identities, {"host:github.com/lzzzyy123/zhuanxie"})
+
+            secret = "not-for-evidence"
+            credential_url = (
+                f"https://project-lead:{secret}@github.com/lzzzyy123/zhuanxie.git"
+            )
+            gate = MergeAuthorizationGate(
+                fixture.registry,
+                fixture.state,
+                verifier,
+                project_lead_principals=frozenset(
+                    {TrustedApprovalPrincipal(LEAD_ACTOR, LEAD_CHANNEL)}
+                ),
+                trusted_remote_url=credential_url,
+                approved_baseline_commit=BASELINE,
+            )
+            normalized = verifier.normalize_remote_identity(credential_url)
+
+            def remote_head(_remote: str, _identity: str, ref_name: str) -> str:
+                if ref_name == "refs/heads/main":
+                    return fixture.candidate.base_commit
+                return fixture.candidate.commit_sha
+
+            with patch.object(
+                verifier, "remote_identity", return_value=normalized
+            ), patch.object(
+                verifier, "resolve_pinned_remote_head", side_effect=remote_head
+            ):
+                decision = gate.evaluate(
+                    fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+                )
+            serialized = json.dumps(decision.evidence, sort_keys=True)
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn("project-lead@", serialized)
+
+            replacement = fixture.root / "other-remote.git"
+            git(fixture.root, "init", "--bare", str(replacement))
+            git(fixture.repo, "remote", "set-url", "origin", str(replacement))
+            retargeted = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(retargeted.disposition, BLOCKED)
+            self.assertTrue(any("pinned repository" in item for item in retargeted.blockers))
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            replacement = fixture.root / "other-remote.git"
+            git(fixture.root, "init", "--bare", str(replacement))
+            git(
+                fixture.repo,
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                str(replacement),
+            )
+            split_remote = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            self.assertEqual(split_remote.disposition, BLOCKED)
+            self.assertTrue(
+                any("different repositories" in item for item in split_remote.blockers)
+            )
 
     def test_level3_main_binding_and_project_lead_identity_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -503,7 +689,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                     (fixture.rfc_id,),
                 )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertTrue(any("Level 3 PASS" in item for item in decision.blockers))
@@ -535,7 +721,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                         (fixture.rfc_id,),
                     )
                 decision = fixture.gate.evaluate(
-                    fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                    fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
                 )
                 self.assertEqual(decision.disposition, BLOCKED)
                 self.assertTrue(any(expected in item for item in decision.blockers))
@@ -563,7 +749,7 @@ class MergeAuthorizationTests(unittest.TestCase):
             )
             git(fixture.repo, "checkout", fixture.candidate.branch)
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertTrue(any("trusted remote ref" in item for item in decision.blockers))
@@ -572,7 +758,7 @@ class MergeAuthorizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = complete_fixture(Path(directory))
             eligible = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(eligible.disposition, AUTO_MERGE_ELIGIBLE)
 
@@ -593,7 +779,202 @@ class MergeAuthorizationTests(unittest.TestCase):
             git(fixture.repo, "checkout", fixture.candidate.branch)
 
             with self.assertRaisesRegex(StateConflict, "stale"):
-                fixture.gate.require_current_eligibility(eligible.decision_digest)
+                fixture.gate.reserve_current_eligibility(
+                    eligible.decision_digest,
+                    "stale-attempt",
+                    "merge-broker:fixture",
+                    str(eligible.evidence["trusted_main_commit"]),
+                )
+
+    def test_authorization_reservation_is_idempotent_fenced_and_single_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            eligible = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(eligible.evidence["trusted_main_commit"])
+            refs_before = git(fixture.repo, "show-ref")
+            reservation = fixture.gate.reserve_current_eligibility(
+                eligible.decision_digest,
+                "merge-attempt-1",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=30,
+                now=100,
+            )
+            repeated = fixture.gate.reserve_current_eligibility(
+                eligible.decision_digest,
+                "merge-attempt-1",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=30,
+                now=101,
+            )
+            self.assertEqual(repeated.reservation_id, reservation.reservation_id)
+            with self.assertRaisesRegex(StateConflict, "already reserved"):
+                fixture.gate.reserve_current_eligibility(
+                    eligible.decision_digest,
+                    "merge-attempt-2",
+                    "merge-broker:fixture",
+                    main,
+                    now=101,
+                )
+            with self.assertRaisesRegex(StateConflict, "stale"):
+                fixture.gate.consume_reserved_eligibility(
+                    reservation.reservation_id,
+                    "merge-broker:other",
+                    reservation.fencing_token,
+                    main,
+                    now=102,
+                )
+            with self.assertRaisesRegex(StateConflict, "fencing"):
+                fixture.gate.consume_reserved_eligibility(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token + 1,
+                    main,
+                    now=102,
+                )
+            with self.assertRaisesRegex(StateConflict, "CAS"):
+                fixture.gate.consume_reserved_eligibility(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                    "b" * 40,
+                    now=102,
+                )
+            consumed = fixture.gate.consume_reserved_eligibility(
+                reservation.reservation_id,
+                "merge-broker:fixture",
+                reservation.fencing_token,
+                main,
+                now=102,
+            )
+            self.assertEqual(consumed.state, "consumed")
+            with self.assertRaisesRegex(StateConflict, "consumable"):
+                fixture.gate.consume_reserved_eligibility(
+                    reservation.reservation_id,
+                    "merge-broker:fixture",
+                    reservation.fencing_token,
+                    main,
+                    now=103,
+                )
+            with self.assertRaisesRegex(StateConflict, "already consumed"):
+                fixture.gate.reserve_current_eligibility(
+                    eligible.decision_digest,
+                    "merge-attempt-3",
+                    "merge-broker:fixture",
+                    main,
+                    now=103,
+                )
+            self.assertEqual(git(fixture.repo, "show-ref"), refs_before)
+            with fixture.state.connect() as connection:
+                events = connection.execute(
+                    "SELECT event_type FROM merge_authorization_events "
+                    "WHERE reservation_id = ? ORDER BY event_id",
+                    (reservation.reservation_id,),
+                ).fetchall()
+            self.assertEqual([row["event_type"] for row in events], ["RESERVED", "CONSUMED"])
+
+    def test_expired_reservation_requires_explicit_abort_and_advances_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            eligible = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(eligible.evidence["trusted_main_commit"])
+            expired = fixture.gate.reserve_current_eligibility(
+                eligible.decision_digest,
+                "expiring-attempt",
+                "merge-broker:fixture",
+                main,
+                lease_seconds=10,
+                now=100,
+            )
+            with self.assertRaisesRegex(StateConflict, "live"):
+                fixture.gate.renew_reservation(
+                    expired.reservation_id,
+                    "merge-broker:fixture",
+                    expired.fencing_token,
+                    now=111,
+                )
+            with self.assertRaisesRegex(StateConflict, "consumable"):
+                fixture.gate.consume_reserved_eligibility(
+                    expired.reservation_id,
+                    "merge-broker:fixture",
+                    expired.fencing_token,
+                    main,
+                    now=111,
+                )
+            with self.assertRaisesRegex(StateConflict, "expired pending explicit abort"):
+                fixture.gate.reserve_current_eligibility(
+                    eligible.decision_digest,
+                    "replacement-before-abort",
+                    "merge-broker:fixture",
+                    main,
+                    now=111,
+                )
+            aborted = fixture.gate.abort_reservation(
+                expired.reservation_id,
+                "merge-broker:fixture",
+                expired.fencing_token,
+                "operator reconciled expired broker process",
+            )
+            self.assertEqual(aborted.state, "aborted")
+            replacement = fixture.gate.reserve_current_eligibility(
+                eligible.decision_digest,
+                "replacement-after-abort",
+                "merge-broker:fixture",
+                main,
+                now=112,
+            )
+            self.assertGreater(replacement.fencing_token, expired.fencing_token)
+            renewed = fixture.gate.renew_reservation(
+                replacement.reservation_id,
+                "merge-broker:fixture",
+                replacement.fencing_token,
+                lease_seconds=20,
+                now=113,
+            )
+            self.assertEqual(renewed.expires_at, 133)
+
+    def test_concurrent_authorization_reservation_has_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            eligible = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            main = str(eligible.evidence["trusted_main_commit"])
+            barrier = Barrier(2)
+            reservations = []
+            failures = []
+
+            def reserve(key: str) -> None:
+                barrier.wait()
+                try:
+                    reservations.append(
+                        fixture.gate.reserve_current_eligibility(
+                            eligible.decision_digest,
+                            key,
+                            "merge-broker:fixture",
+                            main,
+                            now=100,
+                        )
+                    )
+                except StateConflict as exc:
+                    failures.append(str(exc))
+
+            threads = [
+                Thread(target=reserve, args=(f"concurrent-{index}",))
+                for index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(len(reservations), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertIn("already reserved", failures[0])
 
     def test_revision_gate_and_contract_changes_require_human_approval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -622,7 +1003,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 }
                 current_raw["contracts"] = {
                     "provides": {"shared.api": "sha256:" + "7" * 64},
-                    "requires": {},
+                    "requires": {"dependency.api": "sha256:" + "8" * 64},
                     "definitions": {},
                 }
                 current = replace(fixture.rfc, revision=2, raw=current_raw)
@@ -633,6 +1014,7 @@ class MergeAuthorizationTests(unittest.TestCase):
             self.assertFalse(blockers)
             self.assertTrue(any("test gate" in item for item in reasons))
             self.assertTrue(any("interface contract" in item for item in reasons))
+            self.assertTrue(any("required shared interface" in item for item in reasons))
 
     def test_missing_required_evidence_blocks(self) -> None:
         cases = {
@@ -645,7 +1027,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 "Level 3 PASS evidence is missing",
             ),
             "review": (
-                "DELETE FROM review_runs WHERE rfc_id = ?",
+                "UPDATE review_runs SET independent = 0 WHERE rfc_id = ?",
                 "Project Lead approval is not bound to an independent Reviewer PASS",
             ),
             "lead": (
@@ -664,7 +1046,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 with fixture.state.transaction() as connection:
                     connection.execute(statement, (fixture.rfc_id,))
                 decision = fixture.gate.evaluate(
-                    fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                    fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
                 )
                 self.assertEqual(decision.disposition, BLOCKED)
                 self.assertTrue(any(expected in item for item in decision.blockers))
@@ -678,7 +1060,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                     ("f" * 40, fixture.rfc_id),
                 )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertTrue(any("canonical" in item for item in decision.blockers))
@@ -700,7 +1082,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 "drift",
             )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertTrue(any("exact" in item or "identify" in item for item in decision.blockers))
@@ -722,7 +1104,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                     ("fixture-blocker", "FIXTURE", utc_now()),
                 )
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             self.assertEqual(decision.disposition, BLOCKED)
             self.assertIn("RFC still has an active executor lease", decision.blockers)
@@ -739,7 +1121,7 @@ class MergeAuthorizationTests(unittest.TestCase):
                 if setup_dependency is not None:
                     insert_dependency_merge(fixture, stale_contract=setup_dependency)
                 decision = fixture.gate.evaluate(
-                    fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                    fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
                 )
                 self.assertEqual(decision.disposition, BLOCKED)
                 self.assertTrue(any(expected in item for item in decision.blockers))
@@ -748,7 +1130,7 @@ class MergeAuthorizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = complete_fixture(Path(directory))
             decision = fixture.gate.evaluate(
-                fixture.rfc_id, fixture.candidate.candidate_digest, "project-lead"
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
             )
             with fixture.state.connect() as connection:
                 with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
@@ -761,6 +1143,37 @@ class MergeAuthorizationTests(unittest.TestCase):
                     connection.execute(
                         "DELETE FROM merge_authorization_decisions WHERE decision_id = ?",
                         (decision.decision_id,),
+                    )
+
+    def test_reservation_events_are_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = complete_fixture(Path(directory))
+            decision = fixture.gate.evaluate(
+                fixture.rfc_id, fixture.candidate.candidate_digest, LEAD_ACTOR
+            )
+            reservation = fixture.gate.reserve_current_eligibility(
+                decision.decision_digest,
+                "immutable-event-attempt",
+                "merge-broker:fixture",
+                str(decision.evidence["trusted_main_commit"]),
+                now=100,
+            )
+            with fixture.state.connect() as connection:
+                event = connection.execute(
+                    "SELECT event_id FROM merge_authorization_events "
+                    "WHERE reservation_id = ?",
+                    (reservation.reservation_id,),
+                ).fetchone()
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(
+                        "UPDATE merge_authorization_events SET event_type = 'CONSUMED' "
+                        "WHERE event_id = ?",
+                        (event["event_id"],),
+                    )
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                    connection.execute(
+                        "DELETE FROM merge_authorization_events WHERE event_id = ?",
+                        (event["event_id"],),
                     )
 
 

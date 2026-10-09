@@ -51,10 +51,16 @@ The legacy `worker/watcher.py`, filesystem queue, reports and global lock remain
   `NEEDS_HUMAN_APPROVAL`. Missing or stale evidence is `BLOCKED`. No merge
   executor, production wiring, remote fetch, push, or GitHub API call is enabled.
 - Level 3 evidence is bound to the exact trusted-main commit and candidate tree.
-  Authorization also checks the configured Project Lead identity, fixed approved
-  Python baseline, and live trusted remote branch. An immutable eligibility row is historical evidence only: any
-  future executor must re-evaluate it immediately before use and atomically compare
-  the trusted main SHA while publishing. This repository still contains no executor.
+  Authorization also checks a configured Project Lead principal and approval
+  channel, immutable candidate-bound approval evidence, the fixed approved Python
+  baseline, the pinned remote repository identity, and the live remote branch.
+  An immutable eligibility row is historical evidence, never executable authority.
+  A future broker must reserve it with its authenticated identity, an idempotency
+  key, an expected-main compare-and-swap value, a bounded lease and a fencing token.
+  The reservation is consumed exactly once after full revalidation. Expired
+  reservations remain blocked until explicit abort/reconciliation, and every
+  reservation transition is append-only audit evidence. The actual forge merge
+  must use the same expected-main CAS. This repository still contains no executor.
 - Cost and token metrics may be observed but never pause or terminate scheduling. Resource, timeout, throttling and repeated-failure protections remain mandatory.
 
 ## Three Test Levels

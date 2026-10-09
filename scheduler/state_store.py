@@ -267,6 +267,74 @@ BEFORE DELETE ON merge_authorization_decisions
 BEGIN
     SELECT RAISE(ABORT, 'merge authorization audit records are immutable');
 END;
+CREATE TABLE IF NOT EXISTS merge_authorization_fences (
+    decision_digest TEXT PRIMARY KEY
+        REFERENCES merge_authorization_decisions(decision_digest),
+    last_token INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merge_authorization_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    reservation_key TEXT NOT NULL UNIQUE,
+    decision_digest TEXT NOT NULL
+        REFERENCES merge_authorization_decisions(decision_digest),
+    rfc_id TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    holder_identity TEXT NOT NULL,
+    expected_trusted_main_commit TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('reserved', 'consumed', 'aborted')),
+    expires_at REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(decision_digest, fencing_token)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS merge_authorization_single_use_idx
+    ON merge_authorization_reservations(decision_digest)
+    WHERE state IN ('reserved', 'consumed');
+CREATE TABLE IF NOT EXISTS merge_authorization_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL
+        REFERENCES merge_authorization_reservations(reservation_id),
+    event_type TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS merge_authorization_events_reservation_idx
+    ON merge_authorization_events(reservation_id, event_id);
+CREATE TRIGGER IF NOT EXISTS merge_authorization_events_no_update
+BEFORE UPDATE ON merge_authorization_events
+BEGIN
+    SELECT RAISE(ABORT, 'merge authorization events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS merge_authorization_events_no_delete
+BEFORE DELETE ON merge_authorization_events
+BEGIN
+    SELECT RAISE(ABORT, 'merge authorization events are immutable');
+END;
+CREATE TABLE IF NOT EXISTS project_lead_approvals (
+    approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rfc_id TEXT NOT NULL,
+    revision_digest TEXT NOT NULL,
+    candidate_digest TEXT NOT NULL,
+    review_run_id INTEGER NOT NULL REFERENCES review_runs(review_run_id),
+    actor TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL REFERENCES artifacts(digest),
+    created_at TEXT NOT NULL,
+    UNIQUE(rfc_id, revision_digest, candidate_digest, review_run_id)
+);
+CREATE TRIGGER IF NOT EXISTS project_lead_approvals_no_update
+BEFORE UPDATE ON project_lead_approvals
+BEGIN
+    SELECT RAISE(ABORT, 'Project Lead approval records are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS project_lead_approvals_no_delete
+BEFORE DELETE ON project_lead_approvals
+BEGIN
+    SELECT RAISE(ABORT, 'Project Lead approval records are immutable');
+END;
 CREATE TABLE IF NOT EXISTS migration_blockers (
     blocker_key TEXT PRIMARY KEY,
     kind TEXT NOT NULL,

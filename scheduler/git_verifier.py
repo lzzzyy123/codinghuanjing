@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from .runner import RunnerError, RunnerTimeout, run_bounded
 
@@ -14,6 +15,9 @@ from .runner import RunnerError, RunnerTimeout, run_bounded
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SCP_REMOTE_RE = re.compile(
+    r"^(?:[^@/:\s]+@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^\s]+)$"
+)
 
 
 class GitVerificationError(RuntimeError):
@@ -68,7 +72,13 @@ class RepositoryGitVerifier:
             or ".." in ref_name
         ):
             raise ValueError("invalid fully-qualified remote branch")
-        result = self._git("ls-remote", "--heads", remote, ref_name)
+        result = self._git("ls-remote", "--heads", remote, ref_name, check=False)
+        if result.returncode != 0:
+            # Remote stderr can echo a credential-bearing configured URL. Keep
+            # authorization evidence useful without persisting that diagnostic.
+            raise GitVerificationError(
+                f"remote ref query failed ({result.returncode}) for {ref_name}"
+            )
         output = str(result.stdout).strip()
         if not output:
             return None
@@ -82,6 +92,82 @@ class RepositoryGitVerifier:
         if resolved_ref != ref_name or not COMMIT_RE.fullmatch(commit):
             raise GitVerificationError(f"remote returned invalid data for {ref_name}")
         return commit
+
+    def remote_identity(self, remote: str) -> str:
+        """Return a credential-free normalized repository identity for a remote."""
+        if not REMOTE_RE.fullmatch(remote):
+            raise ValueError("invalid Git remote name")
+        identities: list[str] = []
+        for mode in ("fetch", "push"):
+            arguments = ["remote", "get-url", "--all"]
+            if mode == "push":
+                arguments.append("--push")
+            arguments.append(remote)
+            result = self._git(*arguments)
+            urls = [
+                line.strip() for line in str(result.stdout).splitlines() if line.strip()
+            ]
+            if len(urls) != 1:
+                raise GitVerificationError(
+                    f"trusted remote must have exactly one {mode} URL"
+                )
+            identities.append(self.normalize_remote_identity(urls[0]))
+        if identities[0] != identities[1]:
+            raise GitVerificationError(
+                "trusted remote fetch and push URLs identify different repositories"
+            )
+        return identities[0]
+
+    def resolve_pinned_remote_head(
+        self, remote: str, expected_identity: str, ref_name: str
+    ) -> str | None:
+        """Resolve a remote ref while detecting alias retargeting around the request."""
+        before = self.remote_identity(remote)
+        if before != expected_identity:
+            raise GitVerificationError("Git remote does not match the pinned repository identity")
+        commit = self.resolve_remote_head(remote, ref_name)
+        after = self.remote_identity(remote)
+        if after != before:
+            raise GitVerificationError("Git remote identity changed during verification")
+        return commit
+
+    def normalize_remote_identity(self, value: str) -> str:
+        """Normalize SSH/HTTPS/file spellings without retaining credentials."""
+        candidate = value.strip()
+        if not candidate or any(ord(character) < 32 for character in candidate):
+            raise ValueError("invalid Git remote URL")
+        parsed = urlsplit(candidate)
+        if parsed.scheme and parsed.scheme != "file":
+            if parsed.scheme.lower() not in {"http", "https", "ssh", "git"}:
+                raise ValueError("unsupported Git remote URL scheme")
+            if not parsed.hostname or parsed.query or parsed.fragment:
+                raise ValueError("invalid Git remote URL")
+            host = parsed.hostname.lower()
+            port = parsed.port
+            authority = host if port is None else f"{host}:{port}"
+            path = self._normalized_repository_path(unquote(parsed.path))
+            return f"host:{authority}/{path}"
+
+        scp = SCP_REMOTE_RE.fullmatch(candidate)
+        if scp is not None:
+            host = scp.group("host").lower()
+            path = self._normalized_repository_path(scp.group("path"))
+            return f"host:{host}/{path}"
+
+        raw_path = unquote(parsed.path) if parsed.scheme == "file" else candidate
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.repository / path
+        return "file:" + str(path.resolve())
+
+    @staticmethod
+    def _normalized_repository_path(value: str) -> str:
+        path = value.strip().strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if not path or any(part in {"", ".", ".."} for part in path.split("/")):
+            raise ValueError("invalid Git repository path")
+        return path
 
     def candidate_tree(self, commit: str) -> str:
         self.require_commit(commit)
