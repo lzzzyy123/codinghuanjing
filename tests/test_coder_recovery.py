@@ -911,6 +911,82 @@ class CoderContinuationTests(unittest.TestCase):
                 )
             persist.assert_not_called()
 
+    def test_dependency_manifest_may_be_created_once_and_is_bound_to_checkpoint(self) -> None:
+        status: dict[str, object] = {"rfc": RFC_ID, "status": "working"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir = root / "reports" / RFC_ID
+            worktree = root / "worktree"
+            dependency = (
+                worktree / "coordination" / "requests" / RFC_ID / "dependencies.json"
+            )
+
+            def create_dependency(*_args: object) -> str:
+                dependency.parent.mkdir(parents=True)
+                dependency.write_text(
+                    json.dumps(
+                        {
+                            "spec": "dependency-manifest/v1",
+                            "rfc_id": RFC_ID,
+                            "requested_package_changes": [],
+                            "requested_lockfile_changes": [],
+                            "notes": [],
+                        }
+                    )
+                )
+                return coding_report()
+
+            checkpoint = {"checkpoint_digest": "d" * 64}
+            with (
+                mock.patch.object(watcher, "PROJECT_ROOT", Path("/project")),
+                mock.patch.object(watcher, "PROMPTS", ROOT / "worker" / "prompts"),
+                mock.patch.object(watcher, "run_agent", side_effect=create_dependency),
+                mock.patch.object(watcher, "workspace_fingerprint", return_value="fp"),
+                mock.patch.object(watcher, "latest_agent_raw_path", return_value=Path("/raw.json")),
+                mock.patch.object(
+                    watcher, "persist_coder_checkpoint", return_value=checkpoint
+                ) as persist,
+                mock.patch.object(watcher, "update_status"),
+                mock.patch.object(watcher, "record_coder_lifecycle_action"),
+            ):
+                assessment, result = watcher.run_coder_until_gate(
+                    RFC_TEXT,
+                    {"test_command": "true"},
+                    RFC_ID,
+                    worktree,
+                    BRANCH,
+                    BASE_COMMIT,
+                    BASE_COMMIT,
+                    report_dir,
+                    status,
+                    1,
+                    1,
+                    "",
+                )
+            self.assertEqual(assessment.classification, "READY_FOR_TESTS")
+            self.assertEqual(result, checkpoint)
+            bound_dependency = persist.call_args.kwargs["input_binding"]["dependency_manifest"]
+            self.assertTrue(bound_dependency["present"])
+
+    def test_created_dependency_manifest_is_validated_before_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "worktree"
+            dependency = (
+                worktree / "coordination" / "requests" / RFC_ID / "dependencies.json"
+            )
+            dependency.parent.mkdir(parents=True)
+            before = watcher.build_coder_input_binding(
+                RFC_TEXT, {"test_command": "true"}, RFC_ID, worktree
+            )
+            dependency.write_text('{"spec":"dependency-manifest/v1","rfc_id":"wrong"}')
+            after = watcher.build_coder_input_binding(
+                RFC_TEXT, {"test_command": "true"}, RFC_ID, worktree
+            )
+            with self.assertRaisesRegex(
+                watcher.CoderInfrastructureFailure, "RFC identity mismatch"
+            ):
+                watcher.reconcile_coder_input_binding(before, after, worktree, RFC_ID)
+
     def test_invalid_output_never_overwrites_canonical_coder_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1131,6 +1207,108 @@ class RetryCoderControlTests(unittest.TestCase):
             )
             self.assertTrue((root / "todo" / "inbox" / f"{RFC_ID}.md").is_file())
             validate.assert_called_once()
+
+    def test_exhausted_coder_cycles_can_retry_only_from_a_valid_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "failure_kind": None,
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "FAIL",
+                    "tests_passed": False,
+                }
+            )
+            (report_dir / "status.json").write_text(json.dumps(state))
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "git", side_effect=self.git_result),
+                mock.patch.object(control, "validate_coder_checkpoint") as validate,
+            ):
+                control.retry_coder(RFC_ID)
+            updated = json.loads((report_dir / "status.json").read_text())
+            self.assertEqual(updated["status"], "coder_retry_queued")
+            self.assertEqual(
+                updated["coder_retry"]["failure_kind"], "CODER_CYCLES_EXHAUSTED"
+            )
+            validate.assert_called_once()
+
+    def test_exhausted_coder_cycles_without_checkpoint_are_not_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "failure_kind": None,
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "FAIL",
+                    "tests_passed": False,
+                }
+            )
+            state.pop("coder_checkpoint")
+            (report_dir / "status.json").write_text(json.dumps(state))
+            with (
+                mock.patch.object(control, "BASE", root),
+                self.assertRaises(SystemExit),
+            ):
+                control.retry_coder(RFC_ID)
+            self.assertFalse((root / "todo" / "inbox" / f"{RFC_ID}.md").exists())
+
+    def test_input_change_retry_preserves_worktree_and_reruns_coder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state["failure_kind"] = "CODER_INPUT_CHANGED"
+            state["failure"] = "CODER_INPUT_CHANGED: manifest created"
+            state.pop("coder_checkpoint")
+            (report_dir / "status.json").write_text(json.dumps(state))
+            dependency = (
+                worktree / "coordination" / "requests" / RFC_ID / "dependencies.json"
+            )
+            dependency.parent.mkdir(parents=True)
+            dependency.write_text(
+                json.dumps(
+                    {
+                        "spec": "dependency-manifest/v1",
+                        "rfc_id": RFC_ID,
+                        "requested_package_changes": [],
+                        "requested_lockfile_changes": [],
+                        "notes": [],
+                    }
+                )
+            )
+            raw = report_dir / "raw" / "attempt-1-coder-1.json"
+            raw.parent.mkdir()
+            raw.write_text('{"subtype":"success"}')
+            imported = {
+                "classification": "CODER_INPUT_CHANGED",
+                "checkpoint_digest": "e" * 64,
+                "manifest": "coder-checkpoints/input-change.json",
+            }
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "git", side_effect=self.git_result),
+                mock.patch.object(control, "workspace_fingerprint", return_value="fp"),
+                mock.patch.object(
+                    control, "persist_coder_checkpoint", return_value=imported
+                ) as persist,
+                mock.patch.object(control, "validate_coder_checkpoint"),
+            ):
+                control.retry_coder(RFC_ID)
+            updated = json.loads((report_dir / "status.json").read_text())
+            self.assertEqual(updated["status"], "coder_retry_queued")
+            self.assertEqual(updated["coder_checkpoint"], imported)
+            self.assertTrue((root / "todo" / "inbox" / f"{RFC_ID}.md").is_file())
+            self.assertEqual(
+                persist.call_args.args[8], "CODER_INPUT_CHANGED"
+            )
 
     def test_legacy_rfc057_protocol_failure_imports_a_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
