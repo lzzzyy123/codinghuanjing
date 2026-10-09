@@ -56,6 +56,8 @@ PYTHON_BASELINE_ROOT = os.environ.get("PYTHON_BASELINE_ROOT", "").strip()
 PYTHON_BASELINE_COMMIT = os.environ.get("PYTHON_BASELINE_COMMIT", "").strip()
 MAX_REVIEW_CYCLES = int(os.environ.get("MAX_REVIEW_CYCLES", "3"))
 MAX_CODER_CYCLES = int(os.environ.get("MAX_CODER_CYCLES", "5"))
+MAX_CODER_CONTINUATIONS = int(os.environ.get("MAX_CODER_CONTINUATIONS", "16"))
+MAX_CODER_PROTOCOL_RETRIES = int(os.environ.get("MAX_CODER_PROTOCOL_RETRIES", "2"))
 MAX_CONSECUTIVE_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_ERRORS", "3"))
 MAX_REVIEW_FORMAT_REPAIRS = int(os.environ.get("MAX_REVIEW_FORMAT_REPAIRS", "2"))
 MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "1"))
@@ -93,6 +95,10 @@ class ReviewInfrastructureFailure(TaskFailure):
     pass
 
 
+class CoderInfrastructureFailure(TaskFailure):
+    pass
+
+
 @dataclass
 class CommandResult:
     command: str
@@ -104,6 +110,13 @@ class CommandResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0 and not self.timed_out
+
+
+@dataclass(frozen=True)
+class CoderOutputAssessment:
+    classification: str
+    normalized: str
+    errors: tuple[str, ...] = ()
 
 
 def utc_now() -> str:
@@ -463,6 +476,144 @@ def workspace_fingerprint(worktree: Path, base_branch: str) -> str:
     return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
 
 
+def changed_paths(worktree: Path, base_ref: str) -> list[str]:
+    tracked = git(worktree, "diff", "--name-only", "-z", base_ref, "--").stdout
+    untracked = git(worktree, "ls-files", "--others", "--exclude-standard", "-z").stdout
+    return sorted(set(filter(None, (tracked + untracked).split("\0"))))
+
+
+def checkpoint_digest(value: dict[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "checkpoint_digest"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def persist_coder_checkpoint(
+    report_dir: Path,
+    label: str,
+    task_id: str,
+    branch: str,
+    base_commit: str,
+    worktree: Path,
+    base_ref: str,
+    before_fingerprint: str,
+    classification: str,
+    *,
+    raw_path: Optional[Path] = None,
+    diagnostics: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    checkpoints = report_dir / "coder-checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    raw_diff = combined_diff(worktree, base_ref)
+    patch = redact_sensitive_text(raw_diff)
+    patch_path = checkpoints / f"{label}.patch"
+    patch_path.write_text(patch, encoding="utf-8")
+    raw_sha256 = None
+    raw_relative = None
+    if raw_path is not None and raw_path.is_file():
+        raw_relative = str(raw_path.relative_to(report_dir))
+        raw_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "rfc": task_id,
+        "branch": branch,
+        "base_commit": base_commit,
+        "head_commit": git(worktree, "rev-parse", "HEAD").stdout.strip(),
+        "label": label,
+        "classification": classification,
+        "diagnostics": list(diagnostics),
+        "before_fingerprint": before_fingerprint,
+        "after_fingerprint": workspace_fingerprint(worktree, base_ref),
+        "changed_paths": changed_paths(worktree, base_ref),
+        "patch": str(patch_path.relative_to(report_dir)),
+        "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+        "workspace_patch_sha256": hashlib.sha256(raw_diff.encode("utf-8")).hexdigest(),
+        "raw_envelope": raw_relative,
+        "raw_envelope_sha256": raw_sha256,
+    }
+    manifest["checkpoint_digest"] = checkpoint_digest(manifest)
+    manifest_path = checkpoints / f"{label}.json"
+    atomic_json(manifest_path, manifest)
+    manifest["manifest"] = str(manifest_path.relative_to(report_dir))
+    return manifest
+
+
+def validate_coder_checkpoint(
+    report_dir: Path,
+    checkpoint: dict[str, Any],
+    task_id: str,
+    branch: str,
+    base_commit: str,
+    worktree: Path,
+    base_ref: str,
+) -> dict[str, Any]:
+    manifest_relative = str(checkpoint.get("manifest", ""))
+    manifest_path = (report_dir / manifest_relative).resolve()
+    try:
+        manifest_path.relative_to(report_dir.resolve())
+    except ValueError as exc:
+        raise TaskFailure("Coder checkpoint manifest escaped its report directory") from exc
+    if not manifest_path.is_file():
+        raise TaskFailure("Coder checkpoint manifest is missing")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise TaskFailure(f"Coder checkpoint manifest is invalid JSON: {exc}") from exc
+    expected_digest = str(checkpoint.get("checkpoint_digest", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise TaskFailure("Coder checkpoint digest is missing or invalid")
+    if manifest.get("checkpoint_digest") != expected_digest:
+        raise TaskFailure("Coder checkpoint status and manifest digests differ")
+    if checkpoint_digest(manifest) != expected_digest:
+        raise TaskFailure("Coder checkpoint manifest digest is invalid")
+    expected_identity = {
+        "rfc": task_id,
+        "branch": branch,
+        "base_commit": base_commit,
+    }
+    for key, expected in expected_identity.items():
+        if manifest.get(key) != expected:
+            raise TaskFailure(f"Coder checkpoint {key} does not match the retry target")
+    patch_relative = str(manifest.get("patch", ""))
+    patch_path = (report_dir / patch_relative).resolve()
+    try:
+        patch_path.relative_to(report_dir.resolve())
+    except ValueError as exc:
+        raise TaskFailure("Coder checkpoint patch escaped its report directory") from exc
+    if not patch_path.is_file():
+        raise TaskFailure("Coder checkpoint patch is missing")
+    patch = patch_path.read_text(encoding="utf-8")
+    if hashlib.sha256(patch.encode("utf-8")).hexdigest() != manifest.get("patch_sha256"):
+        raise TaskFailure("Coder checkpoint patch digest is invalid")
+    raw_relative = manifest.get("raw_envelope")
+    if raw_relative:
+        raw_path = (report_dir / str(raw_relative)).resolve()
+        try:
+            raw_path.relative_to(report_dir.resolve())
+        except ValueError as exc:
+            raise TaskFailure("Coder raw envelope escaped its report directory") from exc
+        if not raw_path.is_file():
+            raise TaskFailure("Coder raw envelope is missing")
+        if hashlib.sha256(raw_path.read_bytes()).hexdigest() != manifest.get(
+            "raw_envelope_sha256"
+        ):
+            raise TaskFailure("Coder raw envelope digest is invalid")
+    head_commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if head_commit != manifest.get("head_commit"):
+        raise TaskFailure("Coder worktree HEAD changed after the checkpoint was recorded")
+    current_patch = combined_diff(worktree, base_ref)
+    if hashlib.sha256(current_patch.encode("utf-8")).hexdigest() != manifest.get(
+        "workspace_patch_sha256"
+    ):
+        raise TaskFailure("Coder worktree changed after the checkpoint was recorded")
+    if workspace_fingerprint(worktree, base_ref) != manifest.get("after_fingerprint"):
+        raise TaskFailure("Coder worktree fingerprint changed after the checkpoint was recorded")
+    if changed_paths(worktree, base_ref) != manifest.get("changed_paths"):
+        raise TaskFailure("Coder changed paths differ from the checkpoint")
+    return manifest
+
+
 def run_test_command(name: str, command: str, cwd: Path, report_dir: Path) -> CommandResult:
     task_log(report_dir, f"Running {name}: {command}")
     env = {
@@ -814,6 +965,17 @@ CODER_REPORT_HEADINGS = (
     "## Follow-up Suggestions",
 )
 
+CODER_PROTOCOL_MARKERS = (
+    "<|DSML|",
+    "<｜DSML｜",
+    "<DSML",
+    "<tool_calls>",
+    "<tool_call>",
+)
+CODER_COMPLETION_RE = re.compile(
+    r"(?im)^Completion Status:\s*(CONTINUE|READY_FOR_TESTS)\s*$"
+)
+
 
 def coder_report_errors(text: str) -> list[str]:
     return [heading for heading in CODER_REPORT_HEADINGS if heading not in text]
@@ -822,6 +984,38 @@ def coder_report_errors(text: str) -> list[str]:
 def normalize_coder_report(text: str) -> str:
     marker = text.find("# Coding Report")
     return text[marker:].strip() if marker >= 0 else text.strip()
+
+
+def assess_coder_output(text: str) -> CoderOutputAssessment:
+    redacted = redact_sensitive_text(text.strip())
+    if any(marker in redacted for marker in CODER_PROTOCOL_MARKERS):
+        return CoderOutputAssessment(
+            "CODER_PROTOCOL_OUTPUT_INVALID",
+            redacted,
+            ("literal tool-protocol markup appeared in the final result",),
+        )
+    completions = CODER_COMPLETION_RE.findall(redacted)
+    if len(completions) > 1:
+        return CoderOutputAssessment(
+            "CODER_REPORT_INVALID", redacted, ("multiple completion statuses",)
+        )
+    completion = completions[0] if completions else None
+    if completion == "CONTINUE":
+        return CoderOutputAssessment("CONTINUE", redacted)
+    normalized = normalize_coder_report(redacted)
+    missing = tuple(coder_report_errors(normalized))
+    if missing:
+        return CoderOutputAssessment("CODER_REPORT_INVALID", normalized, missing)
+    if completion is not None and completion != "READY_FOR_TESTS":
+        return CoderOutputAssessment(
+            "CODER_REPORT_INVALID", normalized, ("invalid completion status",)
+        )
+    return CoderOutputAssessment("READY_FOR_TESTS", normalized)
+
+
+def latest_agent_raw_path(report_dir: Path, label: str) -> Optional[Path]:
+    candidates = list((report_dir / "raw").glob(f"{label}*.json"))
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
 def markdown_list(items: list[str], empty: str = "None.") -> str:
@@ -1024,9 +1218,124 @@ def coder_prompt(
         + f"\n\n# Runtime Context\n"
         + f"RFC ID: {task_id}\nProject root: {PROJECT_ROOT}\nWorktree: {worktree}\nBranch: {branch}\n"
         + f"Working directory: {worktree}\nCoder cycle: {cycle}/{MAX_CODER_CYCLES}\n"
+        + "The existing worktree is the authoritative checkpoint. Continue from it; do not "
+        + "discard or broadly rewrite prior work without a demonstrated correctness reason. "
+        + "Never print tool-call protocol markup as text. If more implementation work remains, "
+        + "return the required Coder Progress Checkpoint with Completion Status: CONTINUE. "
+        + "Return Completion Status: READY_FOR_TESTS only after the implementation and its "
+        + "required tests are ready for the independent Worker gates.\n"
         + f"\n# RFC\n{rfc_text}\n"
         + correction
     )
+
+
+def run_coder_until_gate(
+    rfc_text: str,
+    task_id: str,
+    worktree: Path,
+    branch: str,
+    base_commit: str,
+    base_ref: str,
+    report_dir: Path,
+    status: dict[str, Any],
+    attempt: int,
+    cycle: int,
+    feedback: str,
+) -> tuple[CoderOutputAssessment, dict[str, Any]]:
+    continuations = 0
+    protocol_retry = 0
+    current_feedback = feedback
+    while True:
+        base_label = f"attempt-{attempt}-coder-{cycle}"
+        label = (
+            base_label
+            if continuations == 0 and protocol_retry == 0
+            else f"{base_label}-continuation-{continuations}-protocol-{protocol_retry}"
+        )
+        before = workspace_fingerprint(worktree, base_ref)
+        answer = run_agent(
+            "Coder",
+            coder_prompt(rfc_text, task_id, worktree, branch, current_feedback, cycle),
+            worktree,
+            report_dir,
+            label,
+        )
+        assessment = assess_coder_output(answer)
+        output_path = report_dir / "coder-outputs" / f"{label}.md"
+        write_redacted(output_path, assessment.normalized + "\n")
+        raw_path = latest_agent_raw_path(report_dir, label)
+        if raw_path is None:
+            raise CoderInfrastructureFailure(
+                "CODER_CHECKPOINT_FAILED: redacted raw Coder envelope is missing"
+            )
+        checkpoint = persist_coder_checkpoint(
+            report_dir,
+            label,
+            task_id,
+            branch,
+            base_commit,
+            worktree,
+            base_ref,
+            before,
+            assessment.classification,
+            raw_path=raw_path,
+            diagnostics=assessment.errors,
+        )
+        update_status(
+            report_dir,
+            status,
+            coder_checkpoint=checkpoint,
+            coder_output_classification=assessment.classification,
+            coder_continuations=continuations,
+            coder_protocol_retries=protocol_retry,
+        )
+        if assessment.classification == "CODER_PROTOCOL_OUTPUT_INVALID":
+            task_log(
+                report_dir,
+                f"Coder protocol output invalid at {label}; checkpoint preserved",
+                logging.ERROR,
+            )
+            if protocol_retry >= MAX_CODER_PROTOCOL_RETRIES:
+                raise CoderInfrastructureFailure(
+                    "CODER_PROTOCOL_OUTPUT_INVALID: literal tool protocol output persisted after "
+                    f"{MAX_CODER_PROTOCOL_RETRIES} controlled retries"
+                )
+            protocol_retry += 1
+            current_feedback = (
+                "The previous final result contained literal tool-call protocol markup. The Worker "
+                "did not execute that markup. Resume from the actual current worktree. Do not repeat "
+                "or quote the markup. Use native tools only during execution, then return exactly one "
+                "Coder Progress Checkpoint or Coding Report with the required Completion Status."
+            )
+            continue
+        protocol_retry = 0
+        if assessment.classification == "CONTINUE":
+            continuations += 1
+            update_status(
+                report_dir,
+                status,
+                phase="coding_checkpoint",
+                coder_continuations=continuations,
+            )
+            task_log(
+                report_dir,
+                f"Coder checkpoint {continuations}/{MAX_CODER_CONTINUATIONS} preserved; continuing",
+            )
+            if continuations >= MAX_CODER_CONTINUATIONS:
+                raise CoderInfrastructureFailure(
+                    "CODER_CONTINUATION_LIMIT_EXCEEDED: implementation did not reach "
+                    f"READY_FOR_TESTS after {MAX_CODER_CONTINUATIONS} checkpoints"
+                )
+            current_feedback = (
+                "Your prior progress checkpoint was preserved. Continue the remaining RFC work from "
+                "the current worktree, focusing on the stated Next Focus. Do not restart completed "
+                "work. Return CONTINUE while work remains or READY_FOR_TESTS with the complete Coding "
+                "Report only when all required implementation and test artifacts are ready.\n\n"
+                + safe_tail(assessment.normalized, 6000)
+            )
+            update_status(report_dir, status, phase="coding")
+            continue
+        return assessment, checkpoint
 
 
 def reviewer_prompt(
@@ -1280,6 +1589,21 @@ def process_task(rfc_path: Path) -> None:
             "pr_url": previous_status.get("pr_url"),
         }
     )
+    if previous_status.get("status") == "coder_retry_queued":
+        recorded_base = str(previous_status.get("base_commit", ""))
+        checkpoint = previous_status.get("coder_checkpoint")
+        if recorded_base != base_commit or not isinstance(checkpoint, dict):
+            raise TaskFailure("Queued Coder retry lost its recorded base or checkpoint")
+        validate_coder_checkpoint(
+            report_dir,
+            checkpoint,
+            task_id,
+            branch,
+            base_commit,
+            worktree,
+            base_ref,
+        )
+        task_log(report_dir, "Revalidated Coder checkpoint after queue claim")
     amendment = previous_status.get("pending_amendment")
     amendment_text = ""
     if isinstance(amendment, dict):
@@ -1405,31 +1729,37 @@ def process_task(rfc_path: Path) -> None:
             review_cycles=review_cycles,
             total_coder_cycles=previous_total_coder + coder_cycle,
         )
-        answer = run_agent(
-            "Coder",
-            coder_prompt(effective_rfc_text, task_id, worktree, branch, feedback, coder_cycle),
+        assessment, checkpoint = run_coder_until_gate(
+            effective_rfc_text,
+            task_id,
             worktree,
+            branch,
+            base_commit,
+            base_ref,
             report_dir,
-            f"attempt-{attempt}-coder-{coder_cycle}",
+            status,
+            attempt,
+            coder_cycle,
+            feedback,
         )
-        answer = normalize_coder_report(answer)
+        answer = assessment.normalized
         (report_dir / f"coder-attempt-{attempt}-cycle-{coder_cycle}.md").write_text(
             answer + "\n", encoding="utf-8"
         )
-        (report_dir / "coder-report.md").write_text(answer + "\n", encoding="utf-8")
-        missing_headings = coder_report_errors(answer)
-        if missing_headings:
+        if assessment.classification != "READY_FOR_TESTS":
             feedback = (
                 "Your Coding Report did not follow the mandatory format. Inspect the existing "
                 "implementation, make any needed corrections, and return a complete report containing: "
-                + ", ".join(missing_headings)
+                + ", ".join(assessment.errors)
             )
             task_log(
                 report_dir,
-                f"Coder report format invalid after cycle {coder_cycle}: {', '.join(missing_headings)}",
+                f"Coder report format invalid after cycle {coder_cycle}: "
+                + ", ".join(assessment.errors),
                 logging.WARNING,
             )
             continue
+        (report_dir / "coder-report.md").write_text(answer + "\n", encoding="utf-8")
         diff = combined_diff(worktree, base_ref)
         (report_dir / "diff.patch").write_text(diff, encoding="utf-8")
 
@@ -1546,6 +1876,34 @@ def handle_claimed(rfc_path: Path) -> None:
     report_dir = REPORTS / task_id
     try:
         process_task(rfc_path)
+    except CoderInfrastructureFailure as exc:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        reason = str(exc)
+        failure_kind = reason.split(":", 1)[0]
+        task_log(report_dir, reason, logging.ERROR)
+        append_text(
+            report_dir / "failure-report.md",
+            f"# Coder Infrastructure Failure\n\n{utc_now()}\n\n{reason}\n",
+        )
+        status_path = report_dir / "status.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            status = {}
+        status.update(
+            {
+                "rfc": task_id,
+                "status": "coder_infra_failed",
+                "phase": "coder_infra_failed",
+                "failure_kind": failure_kind,
+                "failure": reason,
+            }
+        )
+        update_status(report_dir, status, failed_at=utc_now())
+        LOG.debug("Task traceback:\n%s", traceback.format_exc())
+        if rfc_path.exists():
+            os.replace(rfc_path, final_destination(FAILED, rfc_path))
+        return
     except ReviewInfrastructureFailure as exc:
         report_dir.mkdir(parents=True, exist_ok=True)
         reason = str(exc)
@@ -1657,8 +2015,16 @@ def scan_inbox() -> None:
 def validate_runtime() -> None:
     if MAX_CONCURRENT_TASKS != 1:
         raise RuntimeError("This worker version requires MAX_CONCURRENT_TASKS=1")
-    if MAX_REVIEW_CYCLES < 1 or MAX_CODER_CYCLES < 1 or MAX_CONSECUTIVE_ERRORS < 1:
-        raise RuntimeError("Cycle and error limits must be positive")
+    if (
+        MAX_REVIEW_CYCLES < 1
+        or MAX_CODER_CYCLES < 1
+        or MAX_CODER_CONTINUATIONS < 1
+        or MAX_CODER_CONTINUATIONS > 64
+        or MAX_CONSECUTIVE_ERRORS < 1
+    ):
+        raise RuntimeError("Cycle and error limits are outside their supported bounds")
+    if MAX_CODER_PROTOCOL_RETRIES < 0 or MAX_CODER_PROTOCOL_RETRIES > 2:
+        raise RuntimeError("MAX_CODER_PROTOCOL_RETRIES must be between 0 and 2")
     if MAX_REVIEW_FORMAT_REPAIRS < 0 or MAX_REVIEW_FORMAT_REPAIRS > 2:
         raise RuntimeError("MAX_REVIEW_FORMAT_REPAIRS must be between 0 and 2")
     if os.geteuid() != 0:

@@ -15,10 +15,14 @@ from pathlib import Path
 
 from watcher import (
     TASK_ID_RE,
+    assess_coder_output,
     build_review_candidate,
     coder_report_errors,
     parse_rfc,
+    persist_coder_checkpoint,
     update_status,
+    validate_coder_checkpoint,
+    workspace_fingerprint,
 )
 
 
@@ -26,6 +30,7 @@ BASE = Path(os.environ.get("CODING_WORKER_HOME", "/openbayes/home/coding-worker"
 PROJECT_VALUE = os.environ.get("PROJECT_ROOT", "").strip()
 BASE_BRANCH = os.environ.get("BASE_BRANCH", "main").strip()
 GIT_REMOTE = os.environ.get("GIT_REMOTE", "origin").strip()
+MAX_CODER_RECOVERY_ATTEMPTS = int(os.environ.get("MAX_CODER_RECOVERY_ATTEMPTS", "3"))
 
 
 def fail(message: str) -> None:
@@ -166,7 +171,7 @@ def rfc_status(task_id: str) -> None:
         print(f"Failure: {state['failure']}")
 
 
-TERMINAL_STATUSES = {"done", "failed", "review_infra_failed"}
+TERMINAL_STATUSES = {"done", "failed", "review_infra_failed", "coder_infra_failed"}
 
 
 def wait_rfc(task_id: str, timeout_text: str) -> None:
@@ -285,6 +290,155 @@ def retry_review(task_id: str) -> None:
     print(f"Queued Reviewer-only retry for {task_id}; Coder/tests will be reused only if unchanged")
 
 
+def retry_coder(task_id: str) -> None:
+    if not TASK_ID_RE.fullmatch(task_id):
+        fail("invalid RFC ID")
+    if task_is_queued_or_working(task_id):
+        fail("RFC is already queued or working")
+    status_path, state = load_status(task_id)
+    failure_kind = str(state.get("failure_kind", ""))
+    legacy_protocol_failure = (
+        state.get("status") == "failed"
+        and "Exceeded maximum coder cycles" in str(state.get("failure", ""))
+        and state.get("tests_status") in {None, "PENDING"}
+        and not state.get("tests_passed")
+    )
+    if state.get("status") != "coder_infra_failed" and not legacy_protocol_failure:
+        fail("RFC is not eligible for a Coder infrastructure retry")
+    if not legacy_protocol_failure and failure_kind not in {
+        "CODER_PROTOCOL_OUTPUT_INVALID",
+        "CODER_CONTINUATION_LIMIT_EXCEEDED",
+    }:
+        fail("RFC failure is not a recoverable Coder infrastructure condition")
+    if MAX_CODER_RECOVERY_ATTEMPTS < 1 or MAX_CODER_RECOVERY_ATTEMPTS > 10:
+        fail("MAX_CODER_RECOVERY_ATTEMPTS must be between 1 and 10")
+    retry_count = int(state.get("coder_retry_count", 0) or 0)
+    if retry_count >= MAX_CODER_RECOVERY_ATTEMPTS:
+        fail(f"Coder retry limit reached ({MAX_CODER_RECOVERY_ATTEMPTS})")
+    worktree = Path(str(state.get("worktree", ""))).resolve()
+    expected_worktree = (BASE / "worktrees" / task_id).resolve()
+    if worktree != expected_worktree or not worktree.is_dir():
+        fail("RFC worktree is missing or outside the task worktree root")
+    branch = str(state.get("branch", ""))
+    expected_branch = f"agent/{task_id}"
+    if branch != expected_branch:
+        fail("RFC branch does not match its task identity")
+    base_commit = str(state.get("base_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", base_commit):
+        fail("RFC base commit is missing or invalid")
+    active_branch = git(worktree, "branch", "--show-current")
+    if active_branch.returncode != 0 or active_branch.stdout.strip() != branch:
+        fail("RFC worktree is not on its recorded task branch")
+    head = git(worktree, "rev-parse", "HEAD")
+    if head.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head.stdout.strip()):
+        fail("RFC worktree HEAD is unavailable")
+    merge_base = git(worktree, "merge-base", "HEAD", base_commit)
+    if merge_base.returncode != 0 or merge_base.stdout.strip() != base_commit:
+        fail("RFC worktree no longer descends from its recorded base")
+    checkpoint = state.get("coder_checkpoint")
+    if legacy_protocol_failure and not isinstance(checkpoint, dict):
+        outputs = sorted(
+            status_path.parent.glob("coder-attempt-*-cycle-*.md"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not outputs:
+            fail("Legacy Coder failure has no preserved output")
+        latest_output = outputs[-1].read_text(encoding="utf-8")
+        assessment = assess_coder_output(latest_output)
+        if assessment.classification != "CODER_PROTOCOL_OUTPUT_INVALID":
+            fail("Legacy Coder failure is not proven to be a tool protocol failure")
+        output_match = re.fullmatch(r"coder-attempt-([0-9]+)-cycle-([0-9]+)\.md", outputs[-1].name)
+        if output_match is None:
+            fail("Legacy Coder output filename is invalid")
+        raw_prefix = f"attempt-{output_match.group(1)}-coder-{output_match.group(2)}"
+        raw_outputs = sorted(
+            (status_path.parent / "raw").glob(f"{raw_prefix}*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not raw_outputs:
+            fail("Legacy Coder failure has no matching redacted raw envelope")
+        try:
+            raw_envelope = json.loads(raw_outputs[-1].read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            fail(f"Legacy Coder raw envelope is invalid: {exc}")
+        raw_result = raw_envelope.get("result") if isinstance(raw_envelope, dict) else None
+        if not isinstance(raw_result, str) or assess_coder_output(
+            raw_result
+        ).classification != "CODER_PROTOCOL_OUTPUT_INVALID":
+            fail("Legacy raw envelope does not prove a tool protocol failure")
+        imported_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        try:
+            before = workspace_fingerprint(worktree, base_commit)
+            checkpoint = persist_coder_checkpoint(
+                status_path.parent,
+                f"legacy-import-{imported_at}",
+                task_id,
+                branch,
+                base_commit,
+                worktree,
+                base_commit,
+                before,
+                "CODER_PROTOCOL_OUTPUT_INVALID",
+                raw_path=raw_outputs[-1],
+                diagnostics=("imported from legacy exhausted Coder cycles",),
+            )
+        except Exception as exc:
+            fail(f"Could not import legacy Coder checkpoint: {exc}")
+        state["coder_checkpoint"] = checkpoint
+        state["failure_kind"] = "CODER_PROTOCOL_OUTPUT_INVALID"
+        failure_kind = "CODER_PROTOCOL_OUTPUT_INVALID"
+    if not isinstance(checkpoint, dict):
+        fail("RFC has no reusable Coder checkpoint")
+    try:
+        validate_coder_checkpoint(
+            status_path.parent,
+            checkpoint,
+            task_id,
+            branch,
+            base_commit,
+            worktree,
+            base_commit,
+        )
+    except Exception as exc:
+        fail(f"Coder checkpoint validation failed: {exc}")
+    rfc_source = find_task_rfc("failed", task_id)
+    history = state.get("failure_history", [])
+    if not isinstance(history, list):
+        history = []
+    if state.get("failure"):
+        history.append(
+            {
+                "attempt": state.get("attempts"),
+                "failed_at": state.get("failed_at"),
+                "failure": state["failure"],
+                "checkpoint_digest": checkpoint.get("checkpoint_digest"),
+            }
+        )
+    queued_at = datetime.now(timezone.utc).isoformat()
+    state.pop("failure", None)
+    state.pop("failed_at", None)
+    state.update(
+        {
+            "status": "coder_retry_queued",
+            "phase": "coder_retry_queued",
+            "coder_retry_count": retry_count + 1,
+            "coder_retry": {
+                "queued_at": queued_at,
+                "failure_kind": failure_kind,
+                "checkpoint_digest": checkpoint.get("checkpoint_digest"),
+            },
+            "failure_history": history,
+            "updated_at": queued_at,
+        }
+    )
+    update_status(status_path.parent, state)
+    atomic_enqueue_from(rfc_source, task_id)
+    print(
+        f"Queued Coder retry {retry_count + 1}/{MAX_CODER_RECOVERY_ATTEMPTS} for {task_id}; "
+        "validated worktree checkpoint preserved"
+    )
+
+
 AMENDMENT_HEADINGS = (
     "# Project Lead Amendment",
     "## Summary",
@@ -390,6 +544,8 @@ def main() -> None:
         record_pr(sys.argv[2], sys.argv[3])
     elif operation == "retry-review" and len(sys.argv) == 3:
         retry_review(sys.argv[2])
+    elif operation == "retry-coder" and len(sys.argv) == 3:
+        retry_coder(sys.argv[2])
     elif operation == "enqueue-amendment" and len(sys.argv) == 4:
         enqueue_amendment(sys.argv[2], sys.argv[3])
     elif operation == "enqueue-upload" and len(sys.argv) == 4:

@@ -48,7 +48,7 @@ tools/rfc-wait.sh RFC-20260924-003 3600
 tools/create-pr.sh RFC-20260924-003
 ```
 
-`rfc-status.sh` is a point-in-time query. `rfc-wait.sh` keeps one SSH request open until the RFC reaches `done`, `failed`, or `review_infra_failed`, or until its bounded timeout expires; use it instead of shell loops with repeated sleeps. Every status transition is also retained in `reports/<RFC-ID>/events.jsonl`. Status reports include branch, commit, tests, review, push, PR, and compare URL. `create-pr.sh` requires the Mac's `gh` authentication. It reads the Worker-generated PR description, creates or finds the open PR, and records its URL in `status.json`. It never merges.
+`rfc-status.sh` is a point-in-time query. `rfc-wait.sh` keeps one SSH request open until the RFC reaches `done`, `failed`, `review_infra_failed`, or `coder_infra_failed`, or until its bounded timeout expires; use it instead of shell loops with repeated sleeps. Every status transition is also retained in `reports/<RFC-ID>/events.jsonl`. Status reports include branch, commit, tests, review, push, PR, and compare URL. `create-pr.sh` requires the Mac's `gh` authentication. It reads the Worker-generated PR description, creates or finds the open PR, and records its URL in `status.json`. It never merges.
 
 Before reporting completion, inspect the PR diff and these container artifacts:
 
@@ -63,6 +63,20 @@ reports/<RFC-ID>/pr-description.md
 ```
 
 If the RFC failed, report the exact failure and evidence. Do not silently reuse a completed RFC ID or broaden the old RFC; create a new RFC when the requested scope changes.
+
+If status is `coder_infra_failed` with `CODER_PROTOCOL_OUTPUT_INVALID` or
+`CODER_CONTINUATION_LIMIT_EXCEEDED`, inspect the redacted raw envelope and the
+latest manifest in `reports/<RFC-ID>/coder-checkpoints/`. Resume the same RFC
+only through:
+
+```bash
+tools/retry-coder.sh RFC-20261008-057
+```
+
+The command fails closed unless the RFC is idle and its task ID, branch, base,
+HEAD, changed paths, raw output, patch, and workspace fingerprint still match
+the durable checkpoint. Retries are bounded and never reuse passing tests or
+skip independent review.
 
 ## Amend An Unmerged RFC
 

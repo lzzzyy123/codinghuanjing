@@ -114,6 +114,17 @@ class AmendmentFlowTests(unittest.TestCase):
                     return_value=(repo, worktree, "main", f"agent/{RFC_ID}", "a" * 40),
                 ) as prepare,
                 mock.patch.object(watcher, "run_agent", side_effect=run_agent),
+                mock.patch.object(watcher, "workspace_fingerprint", return_value="fingerprint"),
+                mock.patch.object(watcher, "latest_agent_raw_path", return_value=Path("/raw.json")),
+                mock.patch.object(
+                    watcher,
+                    "persist_coder_checkpoint",
+                    return_value={
+                        "classification": "READY_FOR_TESTS",
+                        "checkpoint_digest": "d" * 64,
+                        "manifest": "coder-checkpoints/test.json",
+                    },
+                ),
                 mock.patch.object(watcher, "combined_diff", return_value="diff"),
                 mock.patch.object(watcher, "run_tests", return_value=(True, "module PASS")) as tests,
                 mock.patch.object(
