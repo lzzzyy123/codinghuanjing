@@ -612,6 +612,74 @@ def build_coder_input_binding(
     return binding
 
 
+def validate_coder_dependency_manifest(worktree: Path, task_id: str) -> dict[str, Any]:
+    """Validate a Coder-authored broker request before binding it to a checkpoint."""
+    dependency_path = worktree / "coordination" / "requests" / task_id / "dependencies.json"
+    if not dependency_path.is_file() or dependency_path.is_symlink():
+        raise CoderInfrastructureFailure(
+            "CODER_DEPENDENCY_MANIFEST_INVALID: dependency manifest must be a regular file"
+        )
+    if dependency_path.stat().st_size > 256 * 1024:
+        raise CoderInfrastructureFailure(
+            "CODER_DEPENDENCY_MANIFEST_INVALID: dependency manifest exceeds 256 KiB"
+        )
+    try:
+        manifest = json.loads(dependency_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise CoderInfrastructureFailure(
+            f"CODER_DEPENDENCY_MANIFEST_INVALID: dependency manifest is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise CoderInfrastructureFailure(
+            "CODER_DEPENDENCY_MANIFEST_INVALID: dependency manifest must be an object"
+        )
+    if manifest.get("spec") != "dependency-manifest/v1":
+        raise CoderInfrastructureFailure(
+            "CODER_DEPENDENCY_MANIFEST_INVALID: unsupported dependency manifest spec"
+        )
+    if manifest.get("rfc_id") != task_id:
+        raise CoderInfrastructureFailure(
+            "CODER_DEPENDENCY_MANIFEST_INVALID: dependency manifest RFC identity mismatch"
+        )
+    for key in ("requested_package_changes", "requested_lockfile_changes", "notes"):
+        if not isinstance(manifest.get(key), list):
+            raise CoderInfrastructureFailure(
+                f"CODER_DEPENDENCY_MANIFEST_INVALID: {key} must be an array"
+            )
+    return manifest
+
+
+def reconcile_coder_input_binding(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    worktree: Path,
+    task_id: str,
+) -> dict[str, Any]:
+    """Allow one validated manifest creation, while rejecting mutations to bound inputs."""
+    if before == after:
+        return before
+    before_payload = {
+        key: value for key, value in before.items() if key not in {"digest", "dependency_manifest"}
+    }
+    after_payload = {
+        key: value for key, value in after.items() if key not in {"digest", "dependency_manifest"}
+    }
+    before_dependency = before.get("dependency_manifest")
+    after_dependency = after.get("dependency_manifest")
+    if (
+        before_payload == after_payload
+        and isinstance(before_dependency, dict)
+        and not before_dependency.get("present")
+        and isinstance(after_dependency, dict)
+        and after_dependency.get("present")
+    ):
+        validate_coder_dependency_manifest(worktree, task_id)
+        return after
+    raise CoderInfrastructureFailure(
+        "CODER_INPUT_CHANGED: RFC commands or a bound dependency manifest changed during Coder execution"
+    )
+
+
 def validate_input_binding(binding: dict[str, Any]) -> None:
     digest = str(binding.get("digest", ""))
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -1473,10 +1541,12 @@ def run_coder_until_gate(
             raise CoderInfrastructureFailure(
                 "CODER_CHECKPOINT_FAILED: redacted raw Coder envelope is missing"
             )
-        if build_coder_input_binding(rfc_text, metadata, task_id, worktree) != input_binding:
-            raise CoderInfrastructureFailure(
-                "CODER_INPUT_CHANGED: RFC commands or dependency manifest changed during Coder execution"
-            )
+        input_binding = reconcile_coder_input_binding(
+            input_binding,
+            build_coder_input_binding(rfc_text, metadata, task_id, worktree),
+            worktree,
+            task_id,
+        )
         checkpoint = persist_coder_checkpoint(
             report_dir,
             label,

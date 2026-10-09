@@ -29,6 +29,7 @@ from watcher import (
     rfc_lock,
     update_status,
     validate_coder_checkpoint,
+    validate_coder_dependency_manifest,
     workspace_fingerprint,
 )
 
@@ -361,6 +362,7 @@ def _retry_coder_locked(task_id: str) -> None:
     if not legacy_protocol_failure and failure_kind not in {
         "CODER_PROTOCOL_OUTPUT_INVALID",
         "CODER_CONTINUATION_LIMIT_EXCEEDED",
+        "CODER_INPUT_CHANGED",
     }:
         fail("RFC failure is not a recoverable Coder infrastructure condition")
     if MAX_CODER_RECOVERY_ATTEMPTS < 1 or MAX_CODER_RECOVERY_ATTEMPTS > 10:
@@ -397,6 +399,39 @@ def _retry_coder_locked(task_id: str) -> None:
         effective_rfc_text, metadata, task_id, worktree
     )
     checkpoint = state.get("coder_checkpoint")
+    if failure_kind == "CODER_INPUT_CHANGED" and not isinstance(checkpoint, dict):
+        try:
+            validate_coder_dependency_manifest(worktree, task_id)
+        except Exception as exc:
+            fail(f"Coder input-change recovery manifest is invalid: {exc}")
+        raw_outputs = sorted(
+            (status_path.parent / "raw").glob("attempt-*-coder-*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not raw_outputs:
+            fail("Coder input-change failure has no preserved raw envelope")
+        recovered_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        try:
+            current_fingerprint = workspace_fingerprint(worktree, base_commit)
+            checkpoint = persist_coder_checkpoint(
+                status_path.parent,
+                f"input-change-recovery-{recovered_at}",
+                task_id,
+                branch,
+                base_commit,
+                worktree,
+                base_commit,
+                current_fingerprint,
+                "CODER_INPUT_CHANGED",
+                input_binding=input_binding,
+                raw_path=raw_outputs[-1],
+                diagnostics=(
+                    "Recovered only the stable worktree; Coder, tests, and review must rerun",
+                ),
+            )
+        except Exception as exc:
+            fail(f"Could not preserve input-change recovery checkpoint: {exc}")
+        state["coder_checkpoint"] = checkpoint
     if legacy_protocol_failure and not isinstance(checkpoint, dict):
         outputs = sorted(
             status_path.parent.glob("coder-attempt-*-cycle-*.md"),
