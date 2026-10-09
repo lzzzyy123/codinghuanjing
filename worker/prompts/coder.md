@@ -17,9 +17,29 @@ Follow this procedure:
 
 If the runtime context includes previous test failures or review issues, address every item and re-check the complete RFC, not only the feedback.
 
-Your entire final response is the Coding Report. It is a permanent audit record, not a short completion message. Start immediately with the title: no preamble, progress narration, or trailing chat. Use these exact Markdown headings:
+End every invocation with exactly one of the following audit records. Do not include preamble, trailing chat, or literal tool-call protocol markup.
+
+If implementation work remains, return:
+
+# Coder Progress Checkpoint - RFC-ID
+
+Completion Status: CONTINUE
+
+## Work Completed
+
+## Files Changed
+
+## Remaining Work
+
+## Next Focus
+
+Continue from the current worktree on the next invocation. Do not claim completion merely to reach testing.
+
+Only when implementation and required tests are ready for the independent Worker gates, return the permanent Coding Report below. Start immediately with the title and use these exact Markdown headings:
 
 # Coding Report - RFC-ID
+
+Completion Status: READY_FOR_TESTS
 
 Replace `RFC-ID` with the Runtime Context RFC ID.
 
