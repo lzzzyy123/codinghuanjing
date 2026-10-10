@@ -1746,6 +1746,34 @@ def review_feedback(review: dict[str, Any]) -> str:
     )
 
 
+def retry_review_feedback(report_dir: Path, previous_status: dict[str, Any]) -> str:
+    retry = previous_status.get("coder_retry")
+    if not isinstance(retry, dict):
+        return ""
+    evidence = retry.get("review_feedback")
+    if not isinstance(evidence, dict):
+        return ""
+    name = str(evidence.get("file", ""))
+    review_path = report_dir / name
+    try:
+        review_path.resolve().relative_to(report_dir.resolve())
+    except ValueError as exc:
+        raise TaskFailure("Coder retry review feedback escaped its report directory") from exc
+    if review_path.parent != report_dir or not review_path.is_file():
+        raise TaskFailure("Coder retry review feedback is unavailable")
+    expected_sha = str(evidence.get("sha256", ""))
+    actual_sha = hashlib.sha256(review_path.read_bytes()).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha) or actual_sha != expected_sha:
+        raise TaskFailure("Coder retry review feedback digest changed")
+    try:
+        review = validate_review(review_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise TaskFailure(f"Coder retry review feedback is invalid: {exc}") from exc
+    if review.get("verdict") != "REQUEST_CHANGES":
+        raise TaskFailure("Coder retry review feedback no longer requests changes")
+    return review_feedback(review)
+
+
 def complete_task(
     task_id: str,
     metadata: dict[str, Any],
@@ -1910,6 +1938,11 @@ def process_task(rfc_path: Path) -> None:
     update_status(report_dir, status, phase="coding")
 
     feedback = amendment_text
+    preserved_review_feedback = ""
+    if previous_status.get("status") == "coder_retry_queued":
+        preserved_review_feedback = retry_review_feedback(report_dir, previous_status)
+        if preserved_review_feedback:
+            feedback = preserved_review_feedback
     review_cycles = 0
     coder_report_path = report_dir / "coder-report.md"
     if coder_report_path.is_file():
@@ -2042,6 +2075,11 @@ def process_task(rfc_path: Path) -> None:
                 "implementation, make any needed corrections, and return a complete report containing: "
                 + ", ".join(assessment.errors)
             )
+            if preserved_review_feedback:
+                feedback += (
+                    "\n\nThe original independent-review requirements remain blocking:\n"
+                    + preserved_review_feedback
+                )
             task_log(
                 report_dir,
                 f"Coder report format invalid after cycle {coder_cycle}: "

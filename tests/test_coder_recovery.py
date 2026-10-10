@@ -40,6 +40,23 @@ def command_result(stdout: str = "") -> watcher.CommandResult:
     return watcher.CommandResult("git", 0, stdout, "")
 
 
+def request_changes_review() -> dict[str, object]:
+    return {
+        "verdict": "REQUEST_CHANGES",
+        "summary": "A blocking behavior remains.",
+        "acceptance_criteria": ["AC1: FAIL"],
+        "code_review_findings": ["The defect is reproducible."],
+        "test_review": "The current tests do not cover the defect.",
+        "architecture_scope_review": "The correction remains in scope.",
+        "security_review": "No separate security finding.",
+        "regression_risks": ["The broken behavior remains user-visible."],
+        "required_changes": [
+            "Issue: behavior is incomplete | Location: src/module.ts | "
+            "Reproduction: run the focused test | Acceptance: the focused test passes"
+        ],
+    }
+
+
 def concurrent_retry_coder(root_text: str, start: object, results: object) -> None:
     root = Path(root_text)
 
@@ -1236,6 +1253,86 @@ class RetryCoderControlTests(unittest.TestCase):
                 updated["coder_retry"]["failure_kind"], "CODER_CYCLES_EXHAUSTED"
             )
             validate.assert_called_once()
+
+    def test_exhausted_cycles_after_review_changes_preserve_review_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "failure_kind": None,
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "PASS",
+                    "tests_passed": True,
+                    "review": "REQUEST_CHANGES",
+                }
+            )
+            (report_dir / "status.json").write_text(json.dumps(state))
+            review_path = report_dir / "review-latest.json"
+            review_path.write_text(json.dumps(request_changes_review()))
+            with (
+                mock.patch.object(control, "BASE", root),
+                mock.patch.object(control, "git", side_effect=self.git_result),
+                mock.patch.object(control, "validate_coder_checkpoint"),
+            ):
+                control.retry_coder(RFC_ID)
+            updated = json.loads((report_dir / "status.json").read_text())
+            self.assertEqual(updated["status"], "coder_retry_queued")
+            self.assertEqual(
+                updated["coder_retry"]["failure_kind"],
+                "REVIEW_CHANGES_CYCLES_EXHAUSTED",
+            )
+            evidence = updated["coder_retry"]["review_feedback"]
+            self.assertEqual(evidence["file"], "review-latest.json")
+            self.assertEqual(
+                evidence["sha256"], hashlib.sha256(review_path.read_bytes()).hexdigest()
+            )
+
+    def test_review_change_recovery_rejects_missing_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_dir, _worktree = self.make_layout(root)
+            state = json.loads((report_dir / "status.json").read_text())
+            state.update(
+                {
+                    "status": "failed",
+                    "failure": "TaskFailure: Exceeded maximum coder cycles (5)",
+                    "tests_status": "PASS",
+                    "tests_passed": True,
+                    "review": "REQUEST_CHANGES",
+                }
+            )
+            (report_dir / "status.json").write_text(json.dumps(state))
+            with (
+                mock.patch.object(control, "BASE", root),
+                self.assertRaises(SystemExit),
+            ):
+                control.retry_coder(RFC_ID)
+            self.assertFalse((root / "todo" / "inbox" / f"{RFC_ID}.md").exists())
+
+    def test_retry_review_feedback_is_digest_bound_and_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_dir = Path(directory)
+            review_path = report_dir / "review-latest.json"
+            review_path.write_text(json.dumps(request_changes_review()))
+            previous = {
+                "coder_retry": {
+                    "review_feedback": {
+                        "file": review_path.name,
+                        "sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+                        "verdict": "REQUEST_CHANGES",
+                    }
+                }
+            }
+            feedback = watcher.retry_review_feedback(report_dir, previous)
+            self.assertIn("Independent review requested these changes", feedback)
+            self.assertIn("behavior is incomplete", feedback)
+            review_path.write_text(json.dumps({**request_changes_review(), "summary": "changed"}))
+            with self.assertRaisesRegex(watcher.TaskFailure, "digest changed"):
+                watcher.retry_review_feedback(report_dir, previous)
 
     def test_exhausted_coder_cycles_without_checkpoint_are_not_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

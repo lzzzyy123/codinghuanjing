@@ -30,6 +30,7 @@ from watcher import (
     update_status,
     validate_coder_checkpoint,
     validate_coder_dependency_manifest,
+    validate_review,
     workspace_fingerprint,
 )
 
@@ -357,13 +358,22 @@ def _retry_coder_locked(task_id: str) -> None:
         and state.get("tests_status") in {None, "PENDING"}
         and not state.get("tests_passed")
     )
-    exhausted_cycle_failure = (
+    exhausted_unreviewed_failure = (
         state.get("status") == "failed"
         and str(state.get("failure", "")).startswith("TaskFailure: Exceeded maximum coder cycles")
         and state.get("tests_status") != "PASS"
         and not state.get("tests_passed")
         and isinstance(state.get("coder_checkpoint"), dict)
     )
+    exhausted_review_failure = (
+        state.get("status") == "failed"
+        and str(state.get("failure", "")).startswith("TaskFailure: Exceeded maximum coder cycles")
+        and state.get("tests_status") == "PASS"
+        and state.get("tests_passed") is True
+        and state.get("review") == "REQUEST_CHANGES"
+        and isinstance(state.get("coder_checkpoint"), dict)
+    )
+    exhausted_cycle_failure = exhausted_unreviewed_failure or exhausted_review_failure
     if (
         state.get("status") != "coder_infra_failed"
         and not legacy_protocol_failure
@@ -376,7 +386,25 @@ def _retry_coder_locked(task_id: str) -> None:
         "CODER_INPUT_CHANGED",
     }:
         fail("RFC failure is not a recoverable Coder infrastructure condition")
-    if exhausted_cycle_failure:
+    review_feedback_evidence = None
+    if exhausted_review_failure:
+        review_path = status_path.parent / "review-latest.json"
+        if not review_path.is_file():
+            fail("Reviewer-change recovery requires review-latest.json")
+        try:
+            review = validate_review(review_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            fail(f"Reviewer-change recovery evidence is invalid: {exc}")
+        if review.get("verdict") != "REQUEST_CHANGES":
+            fail("Reviewer-change recovery evidence does not request changes")
+        review_feedback_evidence = {
+            "file": review_path.name,
+            "sha256": hashlib.sha256(review_path.read_bytes()).hexdigest(),
+            "verdict": "REQUEST_CHANGES",
+        }
+        state["failure_kind"] = "REVIEW_CHANGES_CYCLES_EXHAUSTED"
+        failure_kind = "REVIEW_CHANGES_CYCLES_EXHAUSTED"
+    elif exhausted_cycle_failure:
         state["failure_kind"] = "CODER_CYCLES_EXHAUSTED"
         failure_kind = "CODER_CYCLES_EXHAUSTED"
     if MAX_CODER_RECOVERY_ATTEMPTS < 1 or MAX_CODER_RECOVERY_ATTEMPTS > 10:
@@ -538,18 +566,21 @@ def _retry_coder_locked(task_id: str) -> None:
     operation_id = uuid.uuid4().hex
     state.pop("failure", None)
     state.pop("failed_at", None)
+    coder_retry = {
+        "queued_at": queued_at,
+        "failure_kind": failure_kind,
+        "checkpoint_digest": checkpoint.get("checkpoint_digest"),
+        "enqueue_operation_id": operation_id,
+    }
+    if review_feedback_evidence is not None:
+        coder_retry["review_feedback"] = review_feedback_evidence
     state.update(
         {
             "status": "coder_retry_queued",
             "phase": "coder_retry_queued",
             "coder_retry_count": retry_count + 1,
             "total_coder_lifecycle_actions": lifecycle_total + 1,
-            "coder_retry": {
-                "queued_at": queued_at,
-                "failure_kind": failure_kind,
-                "checkpoint_digest": checkpoint.get("checkpoint_digest"),
-                "enqueue_operation_id": operation_id,
-            },
+            "coder_retry": coder_retry,
             "failure_history": history,
             "updated_at": queued_at,
         }
