@@ -1938,6 +1938,7 @@ def process_task(rfc_path: Path) -> None:
     update_status(report_dir, status, phase="coding")
 
     feedback = amendment_text
+    preserved_review_feedback = ""
     if previous_status.get("status") == "coder_retry_queued":
         preserved_review_feedback = retry_review_feedback(report_dir, previous_status)
         if preserved_review_feedback:
@@ -2074,6 +2075,11 @@ def process_task(rfc_path: Path) -> None:
                 "implementation, make any needed corrections, and return a complete report containing: "
                 + ", ".join(assessment.errors)
             )
+            if preserved_review_feedback:
+                feedback += (
+                    "\n\nThe original independent-review requirements remain blocking:\n"
+                    + preserved_review_feedback
+                )
             task_log(
                 report_dir,
                 f"Coder report format invalid after cycle {coder_cycle}: "
